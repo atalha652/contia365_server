@@ -1,0 +1,15 @@
+from app.models.census_data import (
+    CensusDataCreate,
+    CensusDataUpdate,
+    CensusDataResponse,
+    DocumentMetadata,
+    TaxpayerIdentity,
+    FiscalAddress,
+    IncomeData,
+    DeductionItem,
+    DeductionsData,
+    TaxCalculation,
+    HouseholdMember,
+    HouseholdTaxSummary,
+    PlatformVerification,
+)

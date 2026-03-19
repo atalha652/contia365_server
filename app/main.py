@@ -2,7 +2,8 @@ from fastapi import FastAPI
 from contextlib import asynccontextmanager
 from app.routes import (
     api, auth, project, report, accounting, voucher, ledger, ocr,
-    gmail_api, ledgers, outlook_api, dashboard, bank_transactions, billing, modelo
+    gmail_api, ledgers, outlook_api, dashboard, bank_transactions, billing, modelo, onboarding,
+    census_data
 )
 from fastapi.middleware.cors import CORSMiddleware
 from pymongo import MongoClient
@@ -54,6 +55,7 @@ app.add_middleware(
 # Include routes
 app.include_router(api.router, prefix="/api/api")
 app.include_router(auth.router, prefix="/api/auth")
+app.include_router(onboarding.router, prefix="/api/onboarding")  # New onboarding routes
 app.include_router(project.router, prefix="/api/project")
 app.include_router(report.router, prefix="/api/report")
 app.include_router(accounting.router, prefix="/api")
@@ -71,6 +73,9 @@ app.include_router(billing.router, prefix="/api")
 
 # Modelo routes
 app.include_router(modelo.router, prefix="/api")
+
+# Census Data routes
+app.include_router(census_data.router, prefix="/api")
 
 
 @app.get("/")
