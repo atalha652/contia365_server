@@ -102,8 +102,9 @@ class JournalEntry(BaseModel):
     created_at: datetime
     posted_at: Optional[datetime] = None
     
-    class Config:
-        allow_population_by_field_name = True
+    model_config = {
+        "populate_by_name": True
+    }
 
 class VoucherPostingRequest(BaseModel):
     voucher_id: str = Field(..., description="ID of approved voucher to post")

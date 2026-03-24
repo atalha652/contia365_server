@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, validator, ConfigDict
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from enum import Enum
@@ -68,12 +68,11 @@ class Account(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     
-    class Config:
-        allow_population_by_field_name = True
-        json_encoders = {
-            ObjectId: str,
-            Decimal: float
-        }
+    model_config = ConfigDict(
+        populate_by_name=True,
+        json_encoders={ObjectId: str, Decimal: float},
+        arbitrary_types_allowed=True,
+    )
 
     @validator('account_code')
     def validate_account_code(cls, v):
@@ -120,12 +119,11 @@ class JournalEntry(BaseModel):
     transaction_date: datetime
     created_at: datetime = Field(default_factory=datetime.utcnow)
     
-    class Config:
-        allow_population_by_field_name = True
-        json_encoders = {
-            ObjectId: str,
-            Decimal: float
-        }
+    model_config = ConfigDict(
+        populate_by_name=True,
+        json_encoders={ObjectId: str, Decimal: float},
+        arbitrary_types_allowed=True,
+    )
 
     @validator('amount')
     def validate_amount(cls, v):
@@ -155,9 +153,11 @@ class Journal(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     
-    class Config:
-        allow_population_by_field_name = True
-        json_encoders = {ObjectId: str}
+    model_config = ConfigDict(
+        populate_by_name=True,
+        json_encoders={ObjectId: str},
+        arbitrary_types_allowed=True,
+    )
 
 
 class JournalCreate(BaseModel):
@@ -193,12 +193,11 @@ class Voucher(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     
-    class Config:
-        allow_population_by_field_name = True
-        json_encoders = {
-            ObjectId: str,
-            Decimal: float
-        }
+    model_config = ConfigDict(
+        populate_by_name=True,
+        json_encoders={ObjectId: str, Decimal: float},
+        arbitrary_types_allowed=True,
+    )
 
     @validator('total_debit', 'total_credit')
     def validate_totals(cls, v):
@@ -258,12 +257,11 @@ class LedgerEntry(BaseModel):
     posted_at: datetime
     created_at: datetime = Field(default_factory=datetime.utcnow)
     
-    class Config:
-        allow_population_by_field_name = True
-        json_encoders = {
-            ObjectId: str,
-            Decimal: float
-        }
+    model_config = ConfigDict(
+        populate_by_name=True,
+        json_encoders={ObjectId: str, Decimal: float},
+        arbitrary_types_allowed=True,
+    )
 
 
 # ==================== POSTING RULES ====================
@@ -294,9 +292,11 @@ class PostingRule(BaseModel):
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
     
-    class Config:
-        allow_population_by_field_name = True
-        json_encoders = {ObjectId: str}
+    model_config = ConfigDict(
+        populate_by_name=True,
+        json_encoders={ObjectId: str},
+        arbitrary_types_allowed=True,
+    )
 
 
 class PostingRuleCreate(BaseModel):
