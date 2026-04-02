@@ -1,6 +1,6 @@
 """
 Census Data Models for Contia365
-Covers: Certificado de Situación Censal, Modelo 100 (IRPF), Census Tax Declaration
+Covers: Certificado de Situación Censal
 """
 
 from datetime import date, datetime
@@ -18,45 +18,60 @@ class FiscalAddress(BaseModel):
     province: Optional[str] = None
 
 
-# ===== Personal / Taxpayer Info =====
+# ===== Taxpayer Identity =====
 
 class TaxpayerIdentity(BaseModel):
     nif_nie: Optional[str] = None
     full_name: Optional[str] = None
     fiscal_address: Optional[FiscalAddress] = None
+    resident_status: Optional[bool] = None
 
 
-# ===== Income Section (Modelo 100) =====
+# ===== Professional Registration =====
 
-class IncomeData(BaseModel):
-    gross_salary: Optional[float] = None          # Rendimientos del Trabajo
-    withholdings: Optional[float] = None          # Retenciones
-
-
-# ===== Deductions Section (Modelo 100) =====
-
-class DeductionItem(BaseModel):
-    concept: str
-    amount: float
+class EconomicActivity(BaseModel):
+    section: Optional[str] = None           # Empresarial / Profesional
+    code: Optional[str] = None              # IAE code e.g. "967.2"
+    description: Optional[str] = None
+    start_date: Optional[date] = None
+    activity_type_code: Optional[str] = None  # e.g. "A03", "A05"
 
 
-class DeductionsData(BaseModel):
-    items: List[DeductionItem] = []
-    total_deductions: Optional[float] = None
+class ProfessionalRegistration(BaseModel):
+    vat_regime: Optional[str] = None           # e.g. "General"
+    irpf_method: Optional[str] = None          # e.g. "Estimación directa simplificada"
+    economic_activities: List[EconomicActivity] = []
 
 
-# ===== Tax Calculation (Modelo 100) =====
+# ===== Periodic Tax Obligations =====
+
+class PeriodicTaxObligation(BaseModel):
+    modelo: Optional[str] = None              # e.g. "303"
+    description: Optional[str] = None
+    periodicity: Optional[str] = None         # e.g. "TRIMESTRAL"
+
+
+# ===== Income & Expenses Summary =====
+
+class IncomeAndExpensesSummary(BaseModel):
+    total_revenue_period: Optional[float] = None
+    total_deductible_expenses: Optional[float] = None
+    net_profit: Optional[float] = None
+    accumulated_withholdings_received: Optional[float] = None
+
+
+# ===== Tax Calculation =====
 
 class TaxCalculation(BaseModel):
-    taxable_base: Optional[float] = None          # Base Imponible
-    tax_quota: Optional[float] = None             # Cuota Íntegra
-    final_tax: Optional[float] = None             # Cuota Líquida
+    taxable_base: Optional[float] = None
+    tax_quota: Optional[float] = None
+    final_tax: Optional[float] = None
     withholdings_paid: Optional[float] = None
-    result_amount: Optional[float] = None         # positive = to pay, negative = refund
-    result_type: Optional[str] = None             # "Refund" or "Payment"
+    result_amount: Optional[float] = None
+    result_type: Optional[str] = None        # "Refund" or "Payment"
 
 
-# ===== Household Members (Census Tax Declaration) =====
+# ===== Household Data =====
 
 class HouseholdMember(BaseModel):
     name: Optional[str] = None
@@ -65,21 +80,15 @@ class HouseholdMember(BaseModel):
     annual_income: Optional[float] = None
 
 
-# ===== Household Tax Summary (Census Tax Declaration) =====
-
-class HouseholdTaxSummary(BaseModel):
+class HouseholdData(BaseModel):
+    members: List[HouseholdMember] = []
     total_household_income: Optional[float] = None
-    total_deductions: Optional[float] = None
-    taxable_income: Optional[float] = None
-    estimated_tax_liability: Optional[float] = None
-    tax_paid: Optional[float] = None
-    balance_due: Optional[float] = None
 
 
 # ===== Document Metadata =====
 
 class DocumentMetadata(BaseModel):
-    document_type: Optional[str] = None          # e.g. "Modelo 100", "Census Tax Declaration"
+    document_type: Optional[str] = None
     official_name: Optional[str] = None
     issue_date: Optional[date] = None
     csv_code: Optional[str] = None
@@ -99,16 +108,11 @@ class PlatformVerification(BaseModel):
 class CensusDataBase(BaseModel):
     document_metadata: DocumentMetadata = Field(default_factory=DocumentMetadata)
     taxpayer_identity: TaxpayerIdentity = Field(default_factory=TaxpayerIdentity)
-
-    # Modelo 100 / IRPF fields
-    income: Optional[IncomeData] = None
-    deductions: Optional[DeductionsData] = None
+    professional_registration: Optional[ProfessionalRegistration] = None
+    periodic_tax_obligations: List[PeriodicTaxObligation] = []
+    income_and_expenses_summary: Optional[IncomeAndExpensesSummary] = None
     tax_calculation: Optional[TaxCalculation] = None
-
-    # Census Tax Declaration fields
-    household_members: List[HouseholdMember] = []
-    household_tax_summary: Optional[HouseholdTaxSummary] = None
-
+    household_data: Optional[HouseholdData] = None
     platform_verification: PlatformVerification = Field(default_factory=PlatformVerification)
 
     model_config = ConfigDict(
@@ -126,11 +130,11 @@ class CensusDataCreate(CensusDataBase):
 class CensusDataUpdate(BaseModel):
     document_metadata: Optional[DocumentMetadata] = None
     taxpayer_identity: Optional[TaxpayerIdentity] = None
-    income: Optional[IncomeData] = None
-    deductions: Optional[DeductionsData] = None
+    professional_registration: Optional[ProfessionalRegistration] = None
+    periodic_tax_obligations: Optional[List[PeriodicTaxObligation]] = None
+    income_and_expenses_summary: Optional[IncomeAndExpensesSummary] = None
     tax_calculation: Optional[TaxCalculation] = None
-    household_members: Optional[List[HouseholdMember]] = None
-    household_tax_summary: Optional[HouseholdTaxSummary] = None
+    household_data: Optional[HouseholdData] = None
     platform_verification: Optional[PlatformVerification] = None
 
     model_config = ConfigDict(

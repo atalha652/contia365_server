@@ -354,7 +354,8 @@ def login(user: UserLogin):
         "organization_info": db_user.get("organization_info", {}),
         "onboarding_completed": db_user.get("onboarding_completed", False),
         "user_type": db_user.get("user_type_selection", None),
-        "census_data_uploaded": _has_census_data(db_user["_id"])
+        "census_data_uploaded": _has_census_data(db_user["_id"]),
+        "created_at": db_user.get("created_at")
     }
 
 # Get current logged-in user

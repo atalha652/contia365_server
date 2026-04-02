@@ -15,7 +15,6 @@ from pymongo import MongoClient
 
 from app.models.census_data import (
     CensusDataCreate,
-    CensusDataResponse,
     PlatformVerification,
 )
 from app.routes.auth import get_current_user
@@ -130,12 +129,18 @@ async def upload_census_document(
 
     result = census_collection.insert_one(doc)
 
+    taxpayer = extracted.get("taxpayer_identity", {})
     return {
         "message": "Census data extracted and stored successfully.",
         "id": str(result.inserted_id),
         "ocr_confidence_score": confidence,
-        "nif_nie": extracted.get("taxpayer_identity", {}).get("nif_nie"),
-        "full_name": extracted.get("taxpayer_identity", {}).get("full_name"),
+        "nif_nie": taxpayer.get("nif_nie"),
+        "full_name": taxpayer.get("full_name"),
+        "document_type": extracted.get("document_metadata", {}).get("document_type"),
+        "activities_count": len(
+            (extracted.get("professional_registration") or {}).get("economic_activities", [])
+        ),
+        "obligations_count": len(extracted.get("periodic_tax_obligations", [])),
     }
 
 @router.get("/", response_model=List[dict])
