@@ -1,7 +1,7 @@
 """
 OCR Route — OCR.space API for text extraction.
-Images + scanned PDFs → OCR.space API (free, K82495702388957)
-Digital PDFs → pdfplumber (free, instant) with OCR.space fallback
+Images + scanned PDFs → OCR.space API
+Digital PDFs → pdfplumber (instant) with OCR.space fallback for scanned pages
 Data extraction: regex patterns (no AI/LLM)
 """
 
@@ -23,12 +23,11 @@ from app.services.tax_classification_service import TaxClassificationService
 load_dotenv()
 
 # ── Config ───────────────────────────────────────────────────────────────────
-MONGO_URI       = os.getenv("MONGO_URI")
-DB_NAME         = os.getenv("DB_NAME")
-OCR_API_KEY     = os.getenv("OCR_SPACE_API_KEY")   # kept as fallback
-OCR_SPACE_URL   = "https://api.ocr.space/parse/image"
-VISION_CREDS    = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "certs/google_vision_service_account.json")
-bucket_name     = "ai-auto-invoice"
+MONGO_URI     = os.getenv("MONGO_URI")
+DB_NAME       = os.getenv("DB_NAME")
+OCR_API_KEY   = os.getenv("OCR_SPACE_API_KEY")
+OCR_SPACE_URL = "https://api.ocr.space/parse/image"
+bucket_name   = "ai-auto-invoice"
 
 s3 = boto3.client(
     "s3",
@@ -48,44 +47,8 @@ _classifier = TaxClassificationService()
 router = APIRouter(prefix="/accounting/ocr", tags=["OCR"])
 
 
-# ── Google Cloud Vision (service account) ────────────────────────────────────
-
-def _get_vision_client():
-    """Create Vision client using service account JSON."""
-    from google.cloud import vision
-    from google.oauth2 import service_account
-    credentials = service_account.Credentials.from_service_account_file(
-        VISION_CREDS,
-        scopes=["https://www.googleapis.com/auth/cloud-platform"]
-    )
-    return vision.ImageAnnotatorClient(credentials=credentials)
-
-
-def ocr_with_vision(image_bytes: bytes) -> str:
-    """Extract text from image bytes using Google Cloud Vision API."""
-    from google.cloud import vision
-    client = _get_vision_client()
-    image  = vision.Image(content=image_bytes)
-    response = client.document_text_detection(image=image)
-    if response.error.message:
-        raise ValueError(f"Vision API error: {response.error.message}")
-    annotation = response.full_text_annotation
-    text = annotation.text if annotation else ""
-    print(f"[OCR] Vision extracted {len(text)} chars")
-    return text
-
-
-def ocr_image(image_bytes: bytes, file_ext: str = "jpg") -> str:
-    """Extract text from an image — Vision API with OCR.space fallback."""
-    try:
-        return ocr_with_vision(image_bytes)
-    except Exception as e:
-        print(f"[OCR] Vision failed ({e}) — falling back to OCR.space")
-        return ocr_with_ocrspace(image_bytes, file_ext=file_ext)
-
-
 def ocr_with_ocrspace(file_bytes: bytes, file_ext: str = "jpg") -> str:
-    """OCR.space fallback."""
+    """Send file to OCR.space and return extracted text."""
     mime_map = {
         "pdf": "application/pdf", "jpg": "image/jpeg", "jpeg": "image/jpeg",
         "png": "image/png", "gif": "image/gif", "bmp": "image/bmp", "tiff": "image/tiff",
@@ -105,10 +68,15 @@ def ocr_with_ocrspace(file_bytes: bytes, file_ext: str = "jpg") -> str:
     return text
 
 
+def ocr_image(image_bytes: bytes, file_ext: str = "jpg") -> str:
+    """Extract text from an image using OCR.space."""
+    return ocr_with_ocrspace(image_bytes, file_ext=file_ext)
+
+
 def extract_text_from_pdf(pdf_bytes: bytes) -> str:
     """
-    1. pdfplumber — free, instant for digital PDFs
-    2. Vision API — for scanned/image-based PDFs (renders each page)
+    1. pdfplumber — instant for digital PDFs
+    2. OCR.space  — fallback for scanned/image-based PDFs
     """
     import pdfplumber
     text_parts = []
@@ -120,20 +88,9 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
         print(f"[OCR] pdfplumber extracted {len(text)} chars (digital PDF)")
         return text
 
-    # Scanned PDF — render each page → Vision API with OCR.space fallback
-    print("[OCR] pdfplumber empty — rendering pages for Vision API")
-    import pypdfium2 as pdfium
-    doc   = pdfium.PdfDocument(pdf_bytes)
-    parts = []
-    for i, page in enumerate(doc):
-        bitmap  = page.render(scale=2)
-        pil_img = bitmap.to_pil()
-        buf     = io.BytesIO()
-        pil_img.save(buf, format="JPEG", quality=95)
-        page_text = ocr_image(buf.getvalue(), file_ext="jpg")  # uses Vision + fallback
-        print(f"[OCR] page {i+1}: {len(page_text)} chars")
-        parts.append(page_text)
-    return "\n".join(parts)
+    # Scanned PDF — send whole PDF to OCR.space directly
+    print("[OCR] pdfplumber empty — sending to OCR.space")
+    return ocr_with_ocrspace(pdf_bytes, file_ext="pdf")
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
