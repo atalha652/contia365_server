@@ -42,12 +42,11 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS settings
-origins = ["*"]
-
+# CORS — configured here only (not via .env). Use a literal list instead of "*"
+# if you want to restrict to known frontends, e.g. ["http://localhost:5174", "https://app.example.com"].
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
