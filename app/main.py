@@ -41,13 +41,19 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS settings
-origins = ["*"]
+# CORS settings - Allow both production and local development
+origins = [
+    "http://localhost:5173",  # Local Vite dev server
+    "http://localhost:3000",  # Alternative local port
+    "http://127.0.0.1:5173",  # Alternative localhost
+    "https://ai-invoice-automate-backend-njgp.onrender.com",  # Production
+]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
-    allow_methods=["*"],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allow_headers=["*"],
 )
 
@@ -71,6 +77,10 @@ app.include_router(billing.router, prefix="/api")
 
 # Modelo routes
 app.include_router(modelo.router, prefix="/api")
+
+# Tax calculation routes
+from app.routes import tax_calculation
+app.include_router(tax_calculation.router, prefix="/api")
 
 
 @app.get("/")
