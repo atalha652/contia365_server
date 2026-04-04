@@ -192,3 +192,76 @@ async def get_my_tax_deadlines(
     )
 
 
+@router.get("/{user_id}")
+async def get_tax_deadlines_by_user_id(user_id: str):
+    """
+    Legacy endpoint for frontend compatibility.
+    Returns deadline dates for a specific user without authentication.
+    """
+    if not ObjectId.is_valid(user_id):
+        raise HTTPException(status_code=400, detail="Invalid user_id.")
+
+    # Fetch latest census record for user
+    record = db["census_data"].find_one(
+        {"user_id": user_id},
+        sort=[("created_at", -1)]
+    )
+
+    if not record:
+        # Return empty response instead of 404
+        return TaxDeadlinesResponse(
+            user_id=user_id,
+            census_record_id=None,
+            nif_nie=None,
+            full_name=None,
+            deadlines=[],
+            total=0,
+        )
+
+    obligations = record.get("periodic_tax_obligations") or []
+    if not obligations:
+        # Return empty response instead of 404
+        taxpayer = record.get("taxpayer_identity") or {}
+        return TaxDeadlinesResponse(
+            user_id=user_id,
+            census_record_id=str(record["_id"]),
+            nif_nie=taxpayer.get("nif_nie"),
+            full_name=taxpayer.get("full_name"),
+            deadlines=[],
+            total=0,
+        )
+
+    today = date.today()
+    deadlines = []
+
+    for ob in obligations:
+        modelo_no = ob.get("modelo") or "?"
+        description = ob.get("description") or ""
+        periodicity = ob.get("periodicity") or "TRIMESTRAL"
+
+        period_label, deadline_date = _compute_deadline(modelo_no, periodicity, today)
+        days_remaining = (deadline_date - today).days
+
+        deadlines.append(TaxDeadlineItem(
+            modelo=modelo_no,
+            description=description,
+            periodicity=periodicity,
+            current_period=period_label,
+            deadline_date=deadline_date.isoformat(),
+            days_remaining=days_remaining,
+            status=_status(days_remaining),
+        ))
+
+    # Sort by deadline date ascending
+    deadlines.sort(key=lambda x: x.deadline_date)
+
+    taxpayer = record.get("taxpayer_identity") or {}
+
+    return TaxDeadlinesResponse(
+        user_id=user_id,
+        census_record_id=str(record["_id"]),
+        nif_nie=taxpayer.get("nif_nie"),
+        full_name=taxpayer.get("full_name"),
+        deadlines=deadlines,
+        total=len(deadlines),
+    )

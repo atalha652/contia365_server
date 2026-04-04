@@ -310,6 +310,10 @@ class TaxCalculationService:
             amount = Decimal(str(ledger_entry.get("amount", 0)))
             entry_type = ledger_entry.get("entry_type", "")
             
+            # Get AI-determined Modelo ID from ledger entry
+            ai_modelo_id = ledger_entry.get("ai_modelo_id")
+            ai_modelo_confidence = ledger_entry.get("ai_modelo_confidence", 0.0)
+            
             tax_transaction = {
                 "organization_id": organization_id,
                 "transaction_date": ledger_entry.get("transaction_date", datetime.utcnow()),
@@ -317,39 +321,44 @@ class TaxCalculationService:
                 "voucher_id": ledger_entry.get("voucher_id"),
                 "journal_entry_id": ledger_entry.get("journal_entry_id"),
                 "description": ledger_entry.get("description"),
-                "modelo_ids": [],
+                "modelo_ids": [ai_modelo_id] if ai_modelo_id else [],
+                "ai_modelo_id": ai_modelo_id,
+                "ai_modelo_confidence": ai_modelo_confidence,
                 "created_at": datetime.utcnow()
             }
             
             # VAT detection (account codes 4770-4779 for output, 4720-4729 for input)
             if account_code.startswith("477"):  # Output VAT (sales)
                 tax_transaction["vat_type"] = VATType.OUTPUT.value
-                tax_transaction["vat_amount"] = amount
-                tax_transaction["vat_rate"] = self._detect_vat_rate(account_code)
-                tax_transaction["vat_base"] = self._calculate_vat_base(amount, tax_transaction["vat_rate"])
+                tax_transaction["vat_amount"] = float(amount)
+                vat_rate = self._detect_vat_rate(account_code)
+                tax_transaction["vat_rate"] = float(vat_rate)
+                tax_transaction["vat_base"] = float(self._calculate_vat_base(amount, vat_rate))
                 
             elif account_code.startswith("472"):  # Input VAT (purchases)
                 tax_transaction["vat_type"] = VATType.INPUT.value
-                tax_transaction["vat_amount"] = amount
-                tax_transaction["vat_rate"] = self._detect_vat_rate(account_code)
-                tax_transaction["vat_base"] = self._calculate_vat_base(amount, tax_transaction["vat_rate"])
+                tax_transaction["vat_amount"] = float(amount)
+                vat_rate = self._detect_vat_rate(account_code)
+                tax_transaction["vat_rate"] = float(vat_rate)
+                tax_transaction["vat_base"] = float(self._calculate_vat_base(amount, vat_rate))
             
             # IRPF detection (account codes 4750-4759)
             if account_code.startswith("475"):  # IRPF retention
                 tax_transaction["irpf_type"] = IRPFType.RETENTION.value
-                tax_transaction["irpf_amount"] = amount
-                tax_transaction["irpf_rate"] = Decimal("15")  # Default IRPF rate
-                tax_transaction["irpf_base"] = self._calculate_irpf_base(amount, tax_transaction["irpf_rate"])
+                tax_transaction["irpf_amount"] = float(amount)
+                irpf_rate = Decimal("15")  # Default IRPF rate
+                tax_transaction["irpf_rate"] = float(irpf_rate)
+                tax_transaction["irpf_base"] = float(self._calculate_irpf_base(amount, irpf_rate))
             
             # Income detection (revenue accounts 4000-4999)
             elif account_code.startswith("4") and entry_type == "credit":
                 tax_transaction["irpf_type"] = IRPFType.INCOME.value
-                tax_transaction["irpf_base"] = amount
+                tax_transaction["irpf_base"] = float(amount)
             
             # Expense detection (expense accounts 5000-6999)
             elif account_code.startswith(("5", "6")) and entry_type == "debit":
                 tax_transaction["irpf_type"] = IRPFType.EXPENSE.value
-                tax_transaction["irpf_base"] = amount
+                tax_transaction["irpf_base"] = float(amount)
             
             # Only create if tax-relevant
             if tax_transaction.get("vat_type") or tax_transaction.get("irpf_type"):

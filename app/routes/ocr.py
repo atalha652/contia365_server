@@ -19,6 +19,8 @@ from pymongo import MongoClient
 from urllib.parse import unquote
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from app.services.tax_classification_service import TaxClassificationService
+from app.services.ai_modelo_analyzer import AIModeloAnalyzer
+from app.services.invoice_extractor import extract_invoice_data_enhanced
 
 load_dotenv()
 
@@ -43,12 +45,16 @@ ledger_collection   = db["ledger"]
 ocr_jobs_collection = db["ocr_jobs"]
 
 _classifier = TaxClassificationService()
+_ai_analyzer = AIModeloAnalyzer()
 
 router = APIRouter(prefix="/accounting/ocr", tags=["OCR"])
 
 
 def ocr_with_ocrspace(file_bytes: bytes, file_ext: str = "jpg") -> str:
     """Send file to OCR.space and return extracted text."""
+    if not OCR_API_KEY:
+        raise ValueError("OCR_SPACE_API_KEY is not configured in environment variables")
+    
     mime_map = {
         "pdf": "application/pdf", "jpg": "image/jpeg", "jpeg": "image/jpeg",
         "png": "image/png", "gif": "image/gif", "bmp": "image/bmp", "tiff": "image/tiff",
@@ -59,6 +65,11 @@ def ocr_with_ocrspace(file_bytes: bytes, file_ext: str = "jpg") -> str:
         data={"apikey": OCR_API_KEY, "language": "eng", "isOverlayRequired": False, "scale": True, "OCREngine": 2},
         timeout=60,
     )
+    
+    # Better error handling for API issues
+    if response.status_code == 403:
+        raise ValueError("OCR.space API key is invalid or has exceeded quota. Check OCR_SPACE_API_KEY in .env")
+    
     response.raise_for_status()
     result = response.json()
     if result.get("IsErroredOnProcessing"):
@@ -124,7 +135,89 @@ def clean_ocr_text(raw: str) -> str:
 
 # ── Regex invoice extraction ──────────────────────────────────────────────────
 
-def extract_invoice_data(text: str) -> dict:
+def generate_invoice_number(voucher_id: str, file_index: int = 0) -> str:
+    """Generate a system invoice number when extraction fails"""
+    from datetime import datetime
+    timestamp = datetime.utcnow().strftime("%Y%m%d")
+    # Use last 6 chars of voucher_id for uniqueness
+    short_id = str(voucher_id)[-6:].upper()
+    return f"INV-{timestamp}-{short_id}-{file_index}"
+
+
+def extract_supplier_name(text: str, email: str = None) -> str:
+    """Extract supplier name with multiple fallback strategies"""
+    t = text
+
+    # Strategy 1: Look for explicit supplier/vendor/from patterns
+    sup_m = re.search(
+        r"(?:from[:\s]+|supplier[:\s]+|vendor[:\s]+|issued\s*by[:\s]+|"
+        r"company[:\s]+|proveedor[:\s]+|de[:\s]+)([A-Z][^\n]{2,60})",
+        t, re.IGNORECASE
+    )
+    if sup_m:
+        name = sup_m.group(1).strip()
+        # Clean up common noise
+        name = re.sub(r'\s+(invoice|factura|bill|receipt).*$', '', name, flags=re.IGNORECASE)
+        if len(name) > 3:
+            return name
+
+    # Strategy 2: Look for all-caps company names at start of document
+    caps_m = re.search(r"^([A-Z][A-Z\s&\.,]{4,50})$", t, re.MULTILINE)
+    if caps_m:
+        name = caps_m.group(1).strip()
+        if len(name) > 3:
+            return name
+
+    # Strategy 3: Extract from email domain if available
+    if email and email != "N/A":
+        domain_match = re.search(r'@([\w\-]+)', email)
+        if domain_match:
+            domain = domain_match.group(1)
+            # Capitalize first letter of each word
+            return domain.replace('-', ' ').title() + " (from email)"
+
+    # Strategy 4: Look for any capitalized name near the top (first 200 chars)
+    top_text = t[:200]
+    name_m = re.search(r'\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})\b', top_text)
+    if name_m:
+        return name_m.group(1).strip()
+
+    return "Unknown Supplier"
+
+
+def extract_customer_name(text: str, transaction_type: str) -> str:
+    """Extract customer name with fallback strategies"""
+    t = text
+
+    # Strategy 1: Look for explicit customer/bill to patterns
+    cust_m = re.search(
+        r"(?:bill\s*to[:\s]+|invoice\s*to[:\s]+|sold\s*to[:\s]+|"
+        r"customer[:\s]+|cliente[:\s]+|para[:\s]+)([A-Z][^\n]{2,60})",
+        t, re.IGNORECASE
+    )
+    if cust_m:
+        name = cust_m.group(1).strip()
+        # Clean up common noise
+        name = re.sub(r'\s+(invoice|factura|bill|receipt).*$', '', name, flags=re.IGNORECASE)
+        if len(name) > 3:
+            return name
+
+    # Strategy 2: For income transactions, look for "to" patterns
+    if transaction_type == "income":
+        to_m = re.search(r'\bto[:\s]+([A-Z][^\n]{3,50})', t, re.IGNORECASE)
+        if to_m:
+            name = to_m.group(1).strip()
+            if len(name) > 3:
+                return name
+
+    # Fallback based on transaction type
+    if transaction_type == "income":
+        return "Customer (Not Specified)"
+    else:
+        return "Self/Company"
+
+
+def extract_invoice_data(text: str, voucher_id: str = None, file_index: int = 0) -> dict:
     t = text
 
     # Classify as income (you issued the invoice / you receive money)
@@ -146,11 +239,19 @@ def extract_invoice_data(text: str) -> dict:
     else:
         transaction_type = "expense"  # safe default — unknown = treat as cost
 
+    # Extract invoice number with fallback to system-generated
     inv = re.search(
-        r"(?:invoice\s*(?:no|number|#|num)[:\s#]*|inv[:\s#]+|order\s*(?:no|#)[:\s]*)([\w\-/]+)",
+        r"(?:invoice\s*(?:no|number|#|num)[:\s#]*|inv[:\s#]+|n[úu]mero[:\s]+|"
+        r"factura\s*(?:no|n[úu]m)[:\s#]*|order\s*(?:no|#)[:\s]*)([\w\-/]+)",
         t, re.IGNORECASE,
     )
-    invoice_number = inv.group(1).strip() if inv else "N/A"
+    if inv:
+        invoice_number = inv.group(1).strip()
+        # Validate it's not just noise
+        if len(invoice_number) < 2 or invoice_number.lower() in ['no', 'num', 'number']:
+            invoice_number = generate_invoice_number(voucher_id or "unknown", file_index)
+    else:
+        invoice_number = generate_invoice_number(voucher_id or "unknown", file_index)
 
     dates = re.findall(
         r"\b(\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}|\d{4}[\/\-\.]\d{1,2}[\/\-\.]\d{1,2})\b", t
@@ -188,15 +289,13 @@ def extract_invoice_data(text: str) -> dict:
         vat_amount     = vat_amount_raw
         total_with_tax = round(total + vat_amount, 2)
 
-    sup_m    = re.search(r"(?:from[:\s]+|supplier[:\s]+|vendor[:\s]+|issued\s*by[:\s]+|company[:\s]+)([A-Z][^\n]{2,60})", t, re.IGNORECASE)
-    caps_m   = re.search(r"^([A-Z][A-Z\s&\.,]{4,50})$", t, re.MULTILINE)
-    business = sup_m.group(1).strip() if sup_m else (caps_m.group(1).strip() if caps_m else "N/A")
-
+    # Extract email first (used as fallback for supplier name)
     email_m  = re.search(r"[\w\.\-]+@[\w\.\-]+\.\w{2,}", t)
     email    = email_m.group(0) if email_m else "N/A"
 
-    cust_m   = re.search(r"(?:bill\s*to[:\s]+|invoice\s*to[:\s]+|sold\s*to[:\s]+|customer[:\s]+)([A-Z][^\n]{2,60})", t, re.IGNORECASE)
-    customer = cust_m.group(1).strip() if cust_m else "N/A"
+    # Enhanced supplier and customer extraction
+    supplier_name = extract_supplier_name(t, email)
+    customer_name = extract_customer_name(t, transaction_type)
 
     addr          = re.findall(r"\b\d+[\w\s,\.]{5,60}(?:street|st|avenue|ave|road|rd|lane|ln|blvd|calle|plaza|paseo)[^\n]*", t, re.IGNORECASE)
     address_line1 = addr[0].strip() if addr else "N/A"
@@ -211,12 +310,13 @@ def extract_invoice_data(text: str) -> dict:
 
     return {
         "transaction_type": transaction_type,
-        "supplier": {"business_name": business, "address_line1": address_line1, "address_line2": address_line2, "Email": email},
-        "customer": {"company_name": customer, "address_line1": "N/A", "address_line2": "N/A", "Email": "N/A"},
+        "supplier": {"business_name": supplier_name, "address_line1": address_line1, "address_line2": address_line2, "Email": email},
+        "customer": {"company_name": customer_name, "address_line1": "N/A", "address_line2": "N/A", "Email": "N/A"},
         "invoice":  {"invoice_number": invoice_number, "invoice_date": invoice_date, "due_date": due_date, "amount_in_words": "N/A"},
         "items":    items,
         "totals":   {"total": round(total, 2), "VAT_rate": vat_rate, "VAT_amount": round(vat_amount, 2), "Total_with_Tax": round(total_with_tax, 2)},
     }
+
 
 
 # ── Per-voucher worker ────────────────────────────────────────────────────────
@@ -229,9 +329,15 @@ def process_single_voucher(voucher: dict, user_id: str) -> dict:
     )
 
     results = []
+    files = voucher.get("files", [])
+    
+    # Log if no files found
+    if not files:
+        print(f"[OCR] ⚠️ Voucher {voucher_id} has no files")
 
-    for file_obj in voucher.get("files", []):
+    for file_obj in files:
         if not isinstance(file_obj, dict):
+            print(f"[OCR] ⚠️ Skipping non-dict file object in voucher {voucher_id}: {type(file_obj)}")
             continue
 
         # TOON / email
@@ -254,13 +360,45 @@ def process_single_voucher(voucher: dict, user_id: str) -> dict:
                 else:
                     text = readable
 
-                invoice_data  = extract_invoice_data(text)
+                invoice_data  = extract_invoice_data_enhanced(text, voucher_id=voucher_id, file_index=0)
+                
+                # ── AI Modelo Analysis ────────────────────────────────────
+                ai_modelo_result = None
+                try:
+                    ai_modelo_result = _ai_analyzer.analyze_invoice_for_modelo(
+                        invoice_data=invoice_data,
+                        ocr_text=text
+                    )
+                    print(f"[AI Modelo] ✅ Analyzed: {ai_modelo_result.get('modelo_id')} (confidence: {ai_modelo_result.get('confidence')})")
+                except Exception as ae:
+                    print(f"[AI Modelo] ⚠️ Analysis failed: {ae}")
+                
+                # ── Determine account codes and entry type for tax calculations ──
+                tx_type = invoice_data.get("transaction_type", "expense")
+                account_code = "4770" if tx_type == "income" else "4720"  # VAT accounts
+                entry_type = "credit" if tx_type == "income" else "debit"
+                amount = invoice_data.get("totals", {}).get("Total_with_Tax", 0)
+                
                 ledger_result = ledger_collection.insert_one({
-                    "user_id": user_id, "voucher_id": voucher_id,
-                    "file_name": file_name, "data_type": "toon",
-                    "toon_data": toon_data, "ocr_text": text,
+                    "user_id": user_id,
+                    "organization_id": user_id,  # Required for tax calculations
+                    "voucher_id": voucher_id,
+                    "file_name": file_name,
+                    "data_type": "toon",
+                    "toon_data": toon_data,
+                    "ocr_text": text,
                     "invoice_data": invoice_data,
                     "processing_status": "success",
+                    # ── AI Modelo Analysis Results ────────────────────────
+                    "ai_modelo_id": ai_modelo_result.get("modelo_id") if ai_modelo_result else None,
+                    "ai_modelo_confidence": ai_modelo_result.get("confidence") if ai_modelo_result else None,
+                    "ai_modelo_reasoning": ai_modelo_result.get("reasoning") if ai_modelo_result else None,
+                    # ── Accounting fields for tax calculations ──
+                    "account_code": account_code,
+                    "entry_type": entry_type,
+                    "amount": amount,
+                    "transaction_date": datetime.utcnow(),
+                    "description": f"TOON: {file_name}",
                     "created_at": datetime.utcnow(),
                 })
                 ledger_id = str(ledger_result.inserted_id)
@@ -269,8 +407,26 @@ def process_single_voucher(voucher: dict, user_id: str) -> dict:
                     _classifier.classify_ledger_entry(ledger_id, user_id)
                 except Exception as ce:
                     print(f"[ClassificationLayer] ⚠️ toon entry {ledger_id}: {ce}")
+                
+                # ── Create Tax Transaction ───────────────────────────────
+                try:
+                    from app.services.tax_calculation_service import TaxCalculationService
+                    tax_service = TaxCalculationService(db)
+                    tax_tx_id = tax_service.create_tax_transaction_from_ledger(
+                        ledger_entry_id=ledger_id,
+                        organization_id=user_id
+                    )
+                    if tax_tx_id:
+                        print(f"[TaxCalc] ✅ Created tax transaction {tax_tx_id} for ledger {ledger_id}")
+                    else:
+                        print(f"[TaxCalc] ℹ️ No tax transaction needed for ledger {ledger_id}")
+                except Exception as te:
+                    print(f"[TaxCalc] ⚠️ Failed to create tax transaction for {ledger_id}: {te}")
+                
                 results.append({"file_name": file_name, "data_type": "toon", "ledger_id": ledger_id, "status": "success"})
             except Exception as e:
+                import traceback
+                print(f"[OCR] ❌ Failed toon file {file_name} in voucher {voucher_id}:\n{traceback.format_exc()}")
                 results.append({"file_name": file_name, "data_type": "toon", "status": "failed", "error": str(e)})
 
         # Regular file
@@ -302,13 +458,45 @@ def process_single_voucher(voucher: dict, user_id: str) -> dict:
 
                 print(f"[OCR] Extracted {len(raw_text)} chars")
                 cleaned_text  = clean_ocr_text(raw_text)
-                invoice_data  = extract_invoice_data(cleaned_text)
+                invoice_data  = extract_invoice_data_enhanced(cleaned_text, voucher_id=voucher_id, file_index=0)
+                
+                # ── AI Modelo Analysis ────────────────────────────────────
+                ai_modelo_result = None
+                try:
+                    ai_modelo_result = _ai_analyzer.analyze_invoice_for_modelo(
+                        invoice_data=invoice_data,
+                        ocr_text=cleaned_text
+                    )
+                    print(f"[AI Modelo] ✅ Analyzed: {ai_modelo_result.get('modelo_id')} (confidence: {ai_modelo_result.get('confidence')})")
+                except Exception as ae:
+                    print(f"[AI Modelo] ⚠️ Analysis failed: {ae}")
+                
+                # ── Determine account codes and entry type for tax calculations ──
+                tx_type = invoice_data.get("transaction_type", "expense")
+                account_code = "4770" if tx_type == "income" else "4720"  # VAT accounts
+                entry_type = "credit" if tx_type == "income" else "debit"
+                amount = invoice_data.get("totals", {}).get("Total_with_Tax", 0)
+                
                 ledger_result = ledger_collection.insert_one({
-                    "user_id": user_id, "voucher_id": voucher_id,
-                    "file_url": file_url, "s3_key": s3_key,
-                    "data_type": "file", "ocr_text": cleaned_text,
+                    "user_id": user_id,
+                    "organization_id": user_id,  # Required for tax calculations
+                    "voucher_id": voucher_id,
+                    "file_url": file_url,
+                    "s3_key": s3_key,
+                    "data_type": "file",
+                    "ocr_text": cleaned_text,
                     "invoice_data": invoice_data,
                     "processing_status": "success",
+                    # ── AI Modelo Analysis Results ────────────────────────
+                    "ai_modelo_id": ai_modelo_result.get("modelo_id") if ai_modelo_result else None,
+                    "ai_modelo_confidence": ai_modelo_result.get("confidence") if ai_modelo_result else None,
+                    "ai_modelo_reasoning": ai_modelo_result.get("reasoning") if ai_modelo_result else None,
+                    # ── Accounting fields for tax calculations ──
+                    "account_code": account_code,
+                    "entry_type": entry_type,
+                    "amount": amount,
+                    "transaction_date": datetime.utcnow(),
+                    "description": f"Invoice from {invoice_data.get('supplier', {}).get('business_name', 'Unknown')}",
                     "created_at": datetime.utcnow(),
                 })
                 ledger_id = str(ledger_result.inserted_id)
@@ -317,16 +505,63 @@ def process_single_voucher(voucher: dict, user_id: str) -> dict:
                     _classifier.classify_ledger_entry(ledger_id, user_id)
                 except Exception as ce:
                     print(f"[ClassificationLayer] ⚠️ file entry {ledger_id}: {ce}")
+                
+                # ── Create Tax Transaction ───────────────────────────────
+                try:
+                    from app.services.tax_calculation_service import TaxCalculationService
+                    tax_service = TaxCalculationService(db)
+                    tax_tx_id = tax_service.create_tax_transaction_from_ledger(
+                        ledger_entry_id=ledger_id,
+                        organization_id=user_id
+                    )
+                    if tax_tx_id:
+                        print(f"[TaxCalc] ✅ Created tax transaction {tax_tx_id} for ledger {ledger_id}")
+                    else:
+                        print(f"[TaxCalc] ℹ️ No tax transaction needed for ledger {ledger_id}")
+                except Exception as te:
+                    print(f"[TaxCalc] ⚠️ Failed to create tax transaction for {ledger_id}: {te}")
+                
                 results.append({"file_url": file_url, "s3_key": s3_key, "data_type": "file", "ledger_id": ledger_id, "status": "success"})
                 print(f"[OCR] ✅ Success: {s3_key}")
             except Exception as e:
                 import traceback
                 print(f"[OCR] ❌ Failed: {s3_key}\n{traceback.format_exc()}")
                 results.append({"file_url": file_url, "s3_key": s3_key, "data_type": "file", "status": "failed", "error": str(e)})
+        
+        # Handle files that don't have expected structure
+        else:
+            print(f"[OCR] ⚠️ Skipping file with unexpected structure in voucher {voucher_id}: {file_obj}")
+            results.append({
+                "file_name": file_obj.get("name", "unknown"),
+                "data_type": "unknown",
+                "status": "failed",
+                "error": "File missing required fields (file_url or toon_data)"
+            })
 
-    all_ok     = all(r["status"] == "success" for r in results)
-    any_fail   = any(r["status"] == "failed"  for r in results)
-    ocr_status = "done" if (all_ok and results) else "partial" if any_fail else "failed" if not results else "unknown"
+    # Determine final OCR status
+    if not results:
+        # No files were processed at all
+        ocr_status = "failed"
+        print(f"[OCR] ⚠️ Voucher {voucher_id}: No files processed (had {len(files)} files)")
+    else:
+        success_count = sum(1 for r in results if r["status"] == "success")
+        failed_count = sum(1 for r in results if r["status"] == "failed")
+        
+        if success_count == len(results):
+            # All files succeeded
+            ocr_status = "done"
+        elif success_count > 0 and failed_count > 0:
+            # Mixed results - some succeeded, some failed
+            ocr_status = "partial"
+            print(f"[OCR] ⚠️ Voucher {voucher_id}: Partial success ({success_count}/{len(results)} files)")
+        elif failed_count == len(results):
+            # All files failed
+            ocr_status = "failed"
+        else:
+            # Shouldn't happen, but handle edge case
+            ocr_status = "unknown"
+    
+    print(f"[OCR] Voucher {voucher_id} final status: {ocr_status} ({len(results)} files processed)")
 
     voucher_collection.update_one(
         {"_id": ObjectId(voucher_id)},
@@ -411,3 +646,36 @@ async def get_ocr_job_status(job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
     job["_id"] = str(job["_id"])
     return {"job_id": job_id, "status": job.get("status"), "user_id": job.get("user_id"), "total_vouchers": job.get("total_vouchers"), "created_at": job.get("created_at"), "started_at": job.get("started_at"), "completed_at": job.get("completed_at"), "failed_at": job.get("failed_at"), "error": job.get("error"), "results": job.get("results")}
+
+
+@router.get("/voucher/{voucher_id}/debug")
+async def debug_voucher_files(voucher_id: str):
+    """Debug endpoint to inspect voucher file structure"""
+    try:
+        voucher = voucher_collection.find_one({"_id": ObjectId(voucher_id)})
+        if not voucher:
+            raise HTTPException(status_code=404, detail="Voucher not found")
+        
+        files = voucher.get("files", [])
+        file_analysis = []
+        
+        for idx, file_obj in enumerate(files):
+            analysis = {
+                "index": idx,
+                "type": type(file_obj).__name__,
+                "has_file_url": "file_url" in file_obj if isinstance(file_obj, dict) else False,
+                "has_toon_data": "toon_data" in file_obj if isinstance(file_obj, dict) else False,
+                "has_s3_key": "s3_key" in file_obj if isinstance(file_obj, dict) else False,
+                "keys": list(file_obj.keys()) if isinstance(file_obj, dict) else [],
+                "raw": file_obj
+            }
+            file_analysis.append(analysis)
+        
+        return {
+            "voucher_id": voucher_id,
+            "ocr_status": voucher.get("OCR"),
+            "total_files": len(files),
+            "files_analysis": file_analysis
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))

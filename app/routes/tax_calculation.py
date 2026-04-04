@@ -349,3 +349,89 @@ def health_check():
             "Tax transaction tracking"
         ]
     }
+
+
+# ── Development/Testing endpoints without authentication ──────────────────────
+
+@router.get("/vat/summary/public")
+def get_vat_summary_public(
+    start_date: date = Query(..., description="Period start date"),
+    end_date: date = Query(..., description="Period end date"),
+    organization_id: str = Query(..., description="Organization/User ID"),
+    tax_service: TaxCalculationService = Depends(get_tax_service)
+):
+    """
+    Public VAT summary endpoint (no auth required - for development)
+    Use /vat/summary for production with authentication
+    """
+    try:
+        summary = tax_service.calculate_vat_summary(
+            organization_id=organization_id,
+            start_date=start_date,
+            end_date=end_date
+        )
+        return summary
+    except Exception as e:
+        logger.error(f"Error getting VAT summary: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/irpf/summary/public")
+def get_irpf_summary_public(
+    start_date: date = Query(..., description="Quarter start date"),
+    end_date: date = Query(..., description="Quarter end date"),
+    quarter: int = Query(..., ge=1, le=4, description="Quarter number (1-4)"),
+    organization_id: str = Query(..., description="Organization/User ID"),
+    irpf_rate: Optional[Decimal] = Query(Decimal("20"), description="IRPF rate percentage"),
+    tax_service: TaxCalculationService = Depends(get_tax_service)
+):
+    """
+    Public IRPF summary endpoint (no auth required - for development)
+    Use /irpf/summary for production with authentication
+    """
+    try:
+        summary = tax_service.calculate_irpf_summary(
+            organization_id=organization_id,
+            start_date=start_date,
+            end_date=end_date,
+            quarter=quarter,
+            irpf_rate=irpf_rate
+        )
+        return summary
+    except Exception as e:
+        logger.error(f"Error getting IRPF summary: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/modelo/{modelo_no}/calculation/public")
+def get_modelo_calculation_public(
+    modelo_no: str,
+    start_date: date = Query(..., description="Period start date"),
+    end_date: date = Query(..., description="Period end date"),
+    organization_id: str = Query(..., description="Organization/User ID"),
+    tax_service: TaxCalculationService = Depends(get_tax_service)
+):
+    """
+    Public modelo calculation endpoint (no auth required - for development)
+    Use /modelo/{modelo_no}/calculation for production with authentication
+    """
+    try:
+        calculation = tax_service.get_modelo_calculation(
+            organization_id=organization_id,
+            modelo_no=modelo_no,
+            start_date=start_date,
+            end_date=end_date
+        )
+        
+        if not calculation:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Modelo {modelo_no} not found or not supported"
+            )
+        
+        return calculation
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting modelo calculation: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
