@@ -2,7 +2,8 @@ from fastapi import FastAPI
 from contextlib import asynccontextmanager
 from app.routes import (
     api, auth, project, report, accounting, voucher, ledger, ocr,
-    gmail_api, ledgers, outlook_api, dashboard, bank_transactions, billing, modelo
+    gmail_api, ledgers, outlook_api, dashboard, bank_transactions, billing, modelo, onboarding,
+    census_data, tax_dashboard, tax_engine
 )
 from fastapi.middleware.cors import CORSMiddleware
 from pymongo import MongoClient
@@ -41,25 +42,19 @@ app = FastAPI(
     lifespan=lifespan
 )
 
-# CORS settings - Allow both production and local development
-origins = [
-    "http://localhost:5173",  # Local Vite dev server
-    "http://localhost:3000",  # Alternative local port
-    "http://127.0.0.1:5173",  # Alternative localhost
-    "https://ai-invoice-automate-backend-njgp.onrender.com",  # Production
-]
-
+# CORS — configured here only (not via .env). Use a literal list instead of "*"
+# if you want to restrict to known frontends, e.g. ["http://localhost:5174", "https://app.example.com"].
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+    allow_origins=["*"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # Include routes
 app.include_router(api.router, prefix="/api/api")
 app.include_router(auth.router, prefix="/api/auth")
+app.include_router(onboarding.router, prefix="/api/onboarding")  # New onboarding routes
 app.include_router(project.router, prefix="/api/project")
 app.include_router(report.router, prefix="/api/report")
 app.include_router(accounting.router, prefix="/api")
@@ -78,9 +73,14 @@ app.include_router(billing.router, prefix="/api")
 # Modelo routes
 app.include_router(modelo.router, prefix="/api")
 
-# Tax calculation routes
-from app.routes import tax_calculation
-app.include_router(tax_calculation.router, prefix="/api")
+# Census Data routes
+app.include_router(census_data.router, prefix="/api")
+
+# Tax dashboard routes
+app.include_router(tax_dashboard.router, prefix="/api")
+
+# Tax Calculation Engine routes
+app.include_router(tax_engine.router, prefix="/api")
 
 
 @app.get("/")

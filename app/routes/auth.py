@@ -35,6 +35,7 @@ db = client[DB_NAME]
 users_collection = db["users"]
 oauth_states_collection = db["oauth_states"]
 org_types_collection = db["org_types"]
+census_collection = db["census_data"]
 
 # -------------------- Router --------------------
 router = APIRouter()
@@ -88,21 +89,31 @@ class OtherCertificate(BaseModel):
     name: str
     url_: str
 class UserCreate(BaseModel):
+    # REQUIRED FIELDS for signup
     name: str
     email: EmailStr
-    phone: Optional[str] = None
+    phone: str  # Made required as per specification
     password: str
-    type: UserType
-    tax_id: Optional[str] = None
+    
+    # OPTIONAL FIELDS for signup
+    company_name: Optional[str] = None  # Optional company name
+    tax_id: Optional[str] = None  # Optional NIF
+    
+    # ONBOARDING FIELDS (added for onboarding flow)
+    onboarding_completed: Optional[bool] = False
+    user_type_selection: Optional[str] = None  # "freelancer", "company", "advisor"
+    onboarding_step: Optional[int] = 0
+    
+    # EXISTING OPTIONAL FIELDS (kept for backward compatibility)
+    type: Optional[UserType] = UserType.individual  # Default to individual
     organization_info: Optional[OrganizationInfo] = None
     registration_flow: Optional[str] = None
     has_digital_certificate: Optional[str] = None
     auto_fill: Optional[bool] = False
     dni_nie: Optional[str] = None
     bank_details: Optional[BankDetails] = None
-    # Change this line to properly handle None:
-    payment_method: Optional[PaymentMethod] = None  # This should work now
-    role: Optional[Role] = None
+    payment_method: Optional[PaymentMethod] = None
+    role: Optional[Role] = Role.user  # Default to user role
     connect_to_fnmt: Optional[bool] = False
     connect_to_aeat: Optional[bool] = False
     administrator_check: Optional[bool] = False
@@ -166,41 +177,37 @@ It supports both **individual** and **organization** flows.
 """
 )
 async def signup(
-    # Basic info
-    name: str = Form(..., description="Full name of the user"),
-    email: EmailStr = Form(..., description="Email address (must be unique)"),
-    password: str = Form(..., description="Password (will be hashed)"),
-    type: UserType = Form(..., description="User type: 'individual' or 'organization'"),
-    phone: Optional[str] = Form(None, description="Phone number"),
-    tax_id: Optional[str] = Form(None, description="Tax identification number (NIF/CIF)"),
-
-    # Registration flow
+    # REQUIRED FIELDS
+    name: str = Form(..., description="Full name of the user (REQUIRED)"),
+    email: EmailStr = Form(..., description="Email address - must be unique (REQUIRED)"),
+    phone: str = Form(..., description="Phone number (REQUIRED)"),
+    password: str = Form(..., description="Password - will be hashed (REQUIRED)"),
+    
+    # OPTIONAL FIELDS
+    company_name: Optional[str] = Form(None, description="Company name (OPTIONAL)"),
+    tax_id: Optional[str] = Form(None, description="Tax identification number - NIF (OPTIONAL)"),
+    
+    # SYSTEM FIELDS (optional with defaults)
+    type: Optional[UserType] = Form(UserType.individual, description="User type: 'individual' or 'organization'"),
+    role: Optional[Role] = Form(Role.user, description="User role: 'user' or 'admin'"),
+    
+    # LEGACY FIELDS (kept for backward compatibility - all optional)
     registration_flow: Optional[str] = Form(None, description="Registration flow: 'personal_flow' or 'company_flow'"),
-    role: Optional[Role] = Form(None, description="User role: 'user' or 'admin'"),
-    # Digital certificate
     has_digital_certificate: Optional[str] = Form(None, description="'yes_flow' or 'no_flow'"),
     auto_fill: Optional[bool] = Form(False, description="Auto-fill data if certificate available"),
     dni_nie: Optional[str] = Form(None, description="National ID (DNI/NIE)"),
     iban: Optional[str] = Form(None, description="IBAN (bank account)"),
     account_holder: Optional[str] = Form(None, description="Bank account holder name"),
-    # certificate: UploadFile = File(None, description="Digital certificate file (.p12/.pfx/.pdf)"),
-
-    # FNMT & AEAT
     connect_to_fnmt: Optional[bool] = Form(False, description="Generate FNMT request code"),
     connect_to_aeat: Optional[bool] = Form(False, description="Request AEAT appointment (online/in-person)"),
     status: Optional[bool] = Form(False, description="Status of the organization (default: False)"),
-    # Administration
     administrator_check: Optional[bool] = Form(False, description="Admin validation required?"),
     type_of_administration: Optional[str] = Form(None, description="Type of administration (e.g. central, regional)"),
-
-    # Other certificates
     other_certificate: Optional[str] = Form(
         None,
         description="JSON list of certificates. Example: "
                     "[{\"name\":\"Cert A\",\"url_\":\"https://example.com/a\"}]"
     ),
-
-    # Payment
     payment_method: Optional[str] = Form(None, description="Payment method: Stripe / Redsys / Bizum")
 ):
     # Convert empty string to None
@@ -215,6 +222,19 @@ async def signup(
         except ValueError:
             raise HTTPException(status_code=400, detail="Invalid payment method")
 
+    # Check if email already exists
+    existing_user = users_collection.find_one({"email": email})
+    if existing_user:
+        raise HTTPException(status_code=400, detail="Email already registered")
+
+    # Validate required fields
+    if not name.strip():
+        raise HTTPException(status_code=400, detail="Name is required")
+    if not phone.strip():
+        raise HTTPException(status_code=400, detail="Phone number is required")
+    if len(password) < 6:
+        raise HTTPException(status_code=400, detail="Password must be at least 6 characters")
+
     # Hash password
     hashed_pw = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
@@ -228,24 +248,36 @@ async def signup(
 
 # Build user object
     user = UserCreate(
+        # REQUIRED FIELDS
         name=name,
         email=email,
         phone=phone,
         password=password,
-        type=type,
+        
+        # OPTIONAL FIELDS
+        company_name=company_name,
         tax_id=tax_id,
-        organization_info=None,
+        
+        # SYSTEM FIELDS
+        type=type,
+        role=role,
+        
+        # ONBOARDING FIELDS
+        onboarding_completed=False,  # Always false on signup
+        user_type_selection=None,    # Will be set during onboarding
+        onboarding_step=0,           # Start at step 0
+        
+        # LEGACY FIELDS
         registration_flow=registration_flow,
         has_digital_certificate=has_digital_certificate,
         auto_fill=auto_fill,
         dni_nie=dni_nie,
         bank_details=BankDetails(iban=iban, account_holder=account_holder) if iban and account_holder else None,
-        payment_method=payment_method,  # Use the converted enum
+        payment_method=payment_method_enum,
         connect_to_fnmt=connect_to_fnmt,
         connect_to_aeat=connect_to_aeat,
         administrator_check=administrator_check,
         status=status,
-        role=role,
         type_of_administration=type_of_administration,
         other_certificate=[OtherCertificate(**oc) for oc in other_certs] if other_certs else []
     )
@@ -254,56 +286,51 @@ async def signup(
     new_user = user.dict()
     new_user.update({
         "password_hash": hashed_pw,
-        "certificate_path": cert_path if has_digital_certificate == "yes_flow" else None,
+        "certificate_path": None,  # Will be set if certificate is uploaded
         "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow(),
         "gmail_credentials": user.gmail_credentials.dict() if user.gmail_credentials else None,
+        
+        # ONBOARDING FIELDS
+        "onboarding_completed": False,
+        "user_type_selection": None,
+        "onboarding_step": 0,
+        "onboarding_completed_at": None,
     })
 
-    # Organization handling
-    if user.type == UserType.organization and user.organization_info:
-        org_type = None
-
-        # Case 1: Dropdown selection (type_id provided)
-        if getattr(user.organization_info, "type_id", None):
-            try:
-                org_type = org_types_collection.find_one(
-                    {"_id": ObjectId(user.organization_info.type_id)}
-                )
-            except:
-                raise HTTPException(status_code=400, detail="Invalid organization type ID")
-
-            if not org_type:
-                raise HTTPException(status_code=400, detail="Invalid organization type")
-
-        # Case 2: User entered their own type (type_name provided)
-        elif getattr(user.organization_info, "type_name", None):
-            type_name = user.organization_info.type_name.strip().lower()
-            org_type = org_types_collection.find_one({"name": type_name})
-
-            # If type doesn't exist, insert it
-            if not org_type:
-                inserted_type = org_types_collection.insert_one({
-                    "name": type_name,
-                    "created_at": datetime.utcnow()
-                })
-                org_type = {"_id": inserted_type.inserted_id, "name": type_name}
-
-        else:
-            raise HTTPException(status_code=400, detail="Organization type is required")
-
-        # Save organization info in user document
+    # Handle company name in organization_info if provided
+    if company_name:
         new_user["organization_info"] = {
-            "type": org_type["name"],
-            "company_name": user.organization_info.company_name,
-            "address": user.organization_info.address,
-            "phone": user.organization_info.phone,
+            "company_name": company_name,
+            "type": None,  # Will be set during onboarding
+            "address": None,
+            "phone": phone,  # Use the same phone number
         }
 
     # Insert into database
     result = users_collection.insert_one(new_user)
-    return {"message": "User created successfully", "user_id": str(result.inserted_id)}
+    
+    return {
+        "message": "User created successfully", 
+        "user_id": str(result.inserted_id),
+        "onboarding_required": True,
+        "next_step": "/onboarding",
+        "user_data": {
+            "name": name,
+            "email": email,
+            "phone": phone,
+            "company_name": company_name,
+            "has_company": bool(company_name)
+        }
+    }
 
 # -------------------- Login --------------------
+
+def _has_census_data(user_id: str) -> bool:
+    """Check if the user has uploaded at least one census document."""
+    return census_collection.find_one({"user_id": user_id}) is not None
+
+
 @router.post("/login")
 def login(user: UserLogin):
     db_user = users_collection.find_one({"email": user.email.lower()})
@@ -327,7 +354,11 @@ def login(user: UserLogin):
         "email": db_user["email"],
         "user_id": db_user["_id"],
         "tax_id": db_user["tax_id"],
-        "organization_info": db_user.get("organization_info", {})
+        "organization_info": db_user.get("organization_info", {}),
+        "onboarding_completed": db_user.get("onboarding_completed", False),
+        "user_type": db_user.get("user_type_selection", None),
+        "census_data_uploaded": _has_census_data(db_user["_id"]),
+        "created_at": db_user.get("created_at")
     }
 
 # Get current logged-in user
