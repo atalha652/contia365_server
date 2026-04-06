@@ -45,6 +45,9 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 class UserType(str, Enum):
     individual = "individual"
     organization = "organization"
+    freelancer = "freelancer"
+    company = "company"
+    advisor = "advisor"
 
 # -------------------- Pydantic Models --------------------
 class OrgTypeCreate(BaseModel):
@@ -372,6 +375,25 @@ def get_current_user(token: str = Depends(oauth2_scheme)):
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     return user
+
+# -------------------- Onboarding: Save User Type --------------------
+class OnboardingUpdate(BaseModel):
+    user_type: UserType
+
+@router.patch("/users/onboarding")
+def update_user_type(
+    data: OnboardingUpdate,
+    current_user: dict = Depends(get_current_user)
+):
+    allowed = {UserType.freelancer, UserType.company, UserType.advisor}
+    if data.user_type not in allowed:
+        raise HTTPException(status_code=400, detail="Invalid onboarding type. Choose freelancer, company, or advisor.")
+
+    users_collection.update_one(
+        {"_id": current_user["_id"]},
+        {"$set": {"type": data.user_type, "onboarding_completed": True}}
+    )
+    return {"message": "User type updated successfully", "user_type": data.user_type}
 
 # Example protected route
 @router.get("/dashboard")
