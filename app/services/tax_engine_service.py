@@ -83,9 +83,11 @@ def _extract_amounts(entry: dict) -> dict:
         vat_amount     = round(total_with_tax - base_amount, 2)
     else:
         # Try line items first (most trustworthy pre-VAT base)
+        # Only use items_base if it's clearly less than total_with_tax (i.e. pre-VAT)
         items_base = sum(float(i.get("subtotal") or i.get("unit_price") or 0) for i in items)
         items_vat  = round(items_base * vat_rate / 100, 2)
-        if items_base > 0 and items_base < total_with_tax and abs(items_base + items_vat - total_with_tax) < 1.0:
+        items_is_pretax = items_base > 0 and items_base < total_with_tax and abs(items_base + items_vat - total_with_tax) < 1.0
+        if items_is_pretax:
             base_amount = round(items_base, 2)
             vat_amount  = items_vat
         elif raw_vat > vat_rate and total_with_tax > 0:
@@ -158,7 +160,12 @@ class TaxEngineService:
     def _filter_by_invoice_date(
         self, entries: List[dict], start: datetime, end: datetime
     ) -> List[dict]:
-        """Secondary filter by invoice_date string when available."""
+        """
+        Secondary filter by invoice_date string when available.
+        Only drops entries whose invoice_date is explicitly outside the period
+        AND whose transaction_date is also outside — avoids dropping entries
+        uploaded in one quarter for an invoice from a prior quarter.
+        """
         result = []
         for e in entries:
             date_str = (
@@ -166,9 +173,18 @@ class TaxEngineService:
                 .get("invoice", {})
                 .get("invoice_date", "")
             )
-            if date_str and not _in_quarter(date_str, start, end):
+            # If no invoice_date, keep the entry
+            if not date_str or date_str == "N/A":
+                result.append(e)
                 continue
-            result.append(e)
+            # If invoice_date is in range, keep it
+            if _in_quarter(date_str, start, end):
+                result.append(e)
+                continue
+            # Invoice date is outside range — keep if transaction_date is in range
+            tx_date = e.get("transaction_date")
+            if tx_date and start <= tx_date <= end:
+                result.append(e)
         return result
 
     # ── Modelo 303 ────────────────────────────────────────────────────────────

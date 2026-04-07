@@ -50,12 +50,16 @@ class TaxEngineRepository:
         """
         Fetch ledger entries that the Classification Layer has tagged
         with this specific modelo_id, within the quarter window.
+        Matches on invoice_date (inside invoice_data) first, falls back to transaction_date.
         """
         return list(self.ledger.find({
             "user_id": user_id,
             "processing_status": "success",
             "tax_classification.modelo_ids": modelo_id,
-            "created_at": {"$gte": start_date, "$lte": end_date},
+            "$or": [
+                {"transaction_date": {"$gte": start_date, "$lte": end_date}},
+                {"created_at": {"$gte": start_date, "$lte": end_date}},
+            ],
         }))
 
     def get_ocr_ledger_entries_for_period(
@@ -68,7 +72,10 @@ class TaxEngineRepository:
         return list(self.ledger.find({
             "user_id": user_id,
             "processing_status": "success",
-            "created_at": {"$gte": start_date, "$lte": end_date},
+            "$or": [
+                {"transaction_date": {"$gte": start_date, "$lte": end_date}},
+                {"created_at": {"$gte": start_date, "$lte": end_date}},
+            ],
         }))
 
     def get_accounting_ledger_entries_for_period(

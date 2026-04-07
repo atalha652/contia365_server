@@ -33,6 +33,13 @@ client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
 db = client[DB_NAME]
 census_collection = db["census_data"]
 
+# Compound index for duplicate detection (NIF/NIE + issue date across all users)
+census_collection.create_index(
+    [("taxpayer_identity.nif_nie", 1), ("document_metadata.issue_date", 1)],
+    name="nif_issue_date_idx",
+    sparse=True,
+)
+
 router = APIRouter(prefix="/census-data", tags=["Census Data"])
 
 ALLOWED_CONTENT_TYPES = {
@@ -92,6 +99,27 @@ async def upload_census_document(
             status_code=422,
             detail=f"Document parsing failed: {str(e)}",
         )
+
+    # --- Duplicate check: NIF/NIE + issue date must be unique across all users ---
+    nif_nie = (extracted.get("taxpayer_identity") or {}).get("nif_nie")
+    issue_date = (extracted.get("document_metadata") or {}).get("issue_date")
+
+    if nif_nie and issue_date:
+        existing = census_collection.find_one({
+            "taxpayer_identity.nif_nie": nif_nie,
+            "document_metadata.issue_date": issue_date,
+        })
+        if existing:
+            existing_user_id = str(existing.get("user_id", ""))
+            current_user_id = str(current_user["_id"])
+            if existing_user_id != current_user_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"This document (NIF: {nif_nie}, issued: {issue_date}) "
+                        "has already been uploaded by another user."
+                    ),
+                )
 
     # --- Build platform verification metadata ---
     confidence = build_ocr_confidence(raw_text)

@@ -11,12 +11,12 @@ from datetime import datetime
 from typing import List, Dict, Any
 import certifi
 from dotenv import load_dotenv
-from fastapi.security import OAuth2PasswordBearer
 
 from app.models.onboarding import (
     UserTypeSelection, UserTypeInfo, OnboardingRequest, 
     OnboardingResponse, OnboardingStatus, USER_TYPE_CONFIGS
 )
+from app.routes.auth import get_current_user
 
 # Load environment variables
 load_dotenv()
@@ -30,13 +30,6 @@ users_collection = db["users"]
 
 # Router setup
 router = APIRouter()
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
-
-
-def get_current_user(token: str = Depends(oauth2_scheme)):
-    """Get current user from JWT token - imported from auth.py logic"""
-    from app.routes.auth import get_current_user as auth_get_current_user
-    return auth_get_current_user(token)
 
 
 @router.get("/user-types", response_model=List[UserTypeInfo])
