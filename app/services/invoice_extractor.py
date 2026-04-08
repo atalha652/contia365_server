@@ -146,30 +146,42 @@ def extract_invoice_data_enhanced(text: str, voucher_id: str = None, file_index:
         except Exception:
             return 0.0
 
-    # Extract financial amounts
-    total_m = re.search(r"(?:total|grand\s*total|amount\s*due)[^\d]*(\d[\d,\.]+)", t, re.IGNORECASE)
-    vat_m = re.search(r"(?:vat|iva|tax|igic)[^\d]*(\d[\d,\.]+)", t, re.IGNORECASE)
-    vat_rate_m = re.search(r"(?:vat|iva|tax)[^\d]*(\d{1,2}(?:\.\d+)?)\s*%", t, re.IGNORECASE)
-
+    # Extract financial amounts — read only, never calculate
+    # Total: prefer "Amount to Pay" (rent invoices) then "Total"
+    total_m = re.search(r"(?:amount\s*to\s*pay|total\s*a\s*pagar|grand\s*total|amount\s*due|total)[^\d]*(\d[\d,\.]+)", t, re.IGNORECASE)
     total = parse_amount(total_m.group(1)) if total_m else 0.0
-    vat_amount_raw = parse_amount(vat_m.group(1)) if vat_m else None
-    vat_rate = float(vat_rate_m.group(1)) if vat_rate_m else 21.0
 
-    if vat_amount_raw is None:
-        base_m = re.search(r"(?:subtotal|base|net\s*amount|before\s*tax)[^\d]*(\d[\d,\.]+)", t, re.IGNORECASE)
-        if base_m:
-            base = parse_amount(base_m.group(1))
-            vat_amount = round(base * vat_rate / 100, 2)
-            total_with_tax = round(base + vat_amount, 2)
-            if total == 0.0:
-                total = base
-        else:
-            base = round(total / (1 + vat_rate / 100), 2)
-            vat_amount = round(total - base, 2)
-            total_with_tax = total
-    else:
-        vat_amount = vat_amount_raw
-        total_with_tax = round(total + vat_amount, 2)
+    # Base amount
+    base_m = re.search(r"(?:base\s*(?:amount|rent|imponible)|subtotal|net\s*amount|before\s*tax)[^\d]*(\d[\d,\.]+)", t, re.IGNORECASE)
+    base = parse_amount(base_m.group(1)) if base_m else 0.0
+
+    # VAT/IVA — extract rate and amount separately
+    # Rate: e.g. "VAT (21%)" or "IVA 21%"
+    vat_rate_m = re.search(r"(?:vat|iva|igic)\s*\(?(\d{1,2}(?:\.\d+)?)\s*%\)?", t, re.IGNORECASE)
+    vat_rate = float(vat_rate_m.group(1)) if vat_rate_m else 0.0
+
+    # Amount: only grab the euro/number that comes AFTER the rate pattern, not the % digit itself
+    # e.g. "VAT (21%): €210.00" → 210.00
+    vat_amount = 0.0
+    if vat_rate_m:
+        after_rate = t[vat_rate_m.end():]
+        vat_amt_m = re.search(r"[^\d]*(\d[\d,\.]+)", after_rate)
+        if vat_amt_m:
+            vat_amount = parse_amount(vat_amt_m.group(1))
+
+    # IRPF retention — negative withholding, e.g. "IRPF Retention (19%): -€152.00"
+    irpf_rate_m = re.search(r"irpf[^\d]*(\d{1,2}(?:\.\d+)?)\s*%", t, re.IGNORECASE)
+    irpf_rate = float(irpf_rate_m.group(1)) if irpf_rate_m else 0.0
+
+    irpf_amount = 0.0
+    if irpf_rate_m:
+        after_irpf = t[irpf_rate_m.end():]
+        irpf_amt_m = re.search(r"-?\s*[€$]?\s*(\d[\d,\.]+)", after_irpf)
+        if irpf_amt_m:
+            irpf_amount = parse_amount(irpf_amt_m.group(1))
+
+    # total_with_tax = whatever the invoice says is the final amount — no recalculation
+    total_with_tax = total
 
     # Extract email first (used as fallback for supplier name)
     email_m = re.search(r"[\w\.\-]+@[\w\.\-]+\.\w{2,}", t)
@@ -218,9 +230,12 @@ def extract_invoice_data_enhanced(text: str, voucher_id: str = None, file_index:
         },
         "items": items,
         "totals": {
+            "base": round(base, 2),
             "total": round(total, 2),
             "VAT_rate": vat_rate,
             "VAT_amount": round(vat_amount, 2),
+            "IRPF_rate": irpf_rate,
+            "IRPF_amount": round(irpf_amount, 2),
             "Total_with_Tax": round(total_with_tax, 2)
         },
     }

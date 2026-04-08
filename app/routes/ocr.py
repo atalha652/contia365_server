@@ -5,7 +5,7 @@ Digital PDFs → pdfplumber (instant) with OCR.space fallback for scanned pages
 Data extraction: regex patterns (no AI/LLM)
 """
 
-from fastapi import APIRouter, HTTPException, BackgroundTasks, Form
+from fastapi import APIRouter, HTTPException, BackgroundTasks, Form, Depends
 import io
 import re
 import os
@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from app.services.tax_classification_service import TaxClassificationService
 from app.services.ai_modelo_analyzer import AIModeloAnalyzer
 from app.services.invoice_extractor import extract_invoice_data_enhanced
+from app.utils.period_guard import validate_upload_window
 
 load_dotenv()
 
@@ -265,29 +266,33 @@ def extract_invoice_data(text: str, voucher_id: str = None, file_index: int = 0)
         except Exception:
             return 0.0
 
-    total_m    = re.search(r"(?:total|grand\s*total|amount\s*due)[^\d]*(\d[\d,\.]+)", t, re.IGNORECASE)
-    vat_m      = re.search(r"(?:vat|iva|tax|igic)[^\d]*(\d[\d,\.]+)", t, re.IGNORECASE)
-    vat_rate_m = re.search(r"(?:vat|iva|tax)[^\d]*(\d{1,2}(?:\.\d+)?)\s*%", t, re.IGNORECASE)
+    total_m    = re.search(r"(?:amount\s*to\s*pay|total\s*a\s*pagar|grand\s*total|amount\s*due|total)[^\d]*(\d[\d,\.]+)", t, re.IGNORECASE)
+    total      = parse_amount(total_m.group(1)) if total_m else 0.0
 
-    total          = parse_amount(total_m.group(1)) if total_m else 0.0
-    vat_amount_raw = parse_amount(vat_m.group(1))   if vat_m   else None
-    vat_rate       = float(vat_rate_m.group(1))     if vat_rate_m else 21.0
+    base_m = re.search(r"(?:base\s*(?:amount|rent|imponible)|subtotal|net\s*amount|before\s*tax)[^\d]*(\d[\d,\.]+)", t, re.IGNORECASE)
+    base   = parse_amount(base_m.group(1)) if base_m else 0.0
 
-    if vat_amount_raw is None:
-        base_m = re.search(r"(?:subtotal|base|net\s*amount|before\s*tax)[^\d]*(\d[\d,\.]+)", t, re.IGNORECASE)
-        if base_m:
-            base           = parse_amount(base_m.group(1))
-            vat_amount     = round(base * vat_rate / 100, 2)
-            total_with_tax = round(base + vat_amount, 2)
-            if total == 0.0:
-                total = base
-        else:
-            base           = round(total / (1 + vat_rate / 100), 2)
-            vat_amount     = round(total - base, 2)
-            total_with_tax = total
-    else:
-        vat_amount     = vat_amount_raw
-        total_with_tax = round(total + vat_amount, 2)
+    vat_rate_m = re.search(r"(?:vat|iva|igic)\s*\(?(\d{1,2}(?:\.\d+)?)\s*%\)?", t, re.IGNORECASE)
+    vat_rate   = float(vat_rate_m.group(1)) if vat_rate_m else 0.0
+
+    vat_amount = 0.0
+    if vat_rate_m:
+        after_rate = t[vat_rate_m.end():]
+        vat_amt_m  = re.search(r"[^\d]*(\d[\d,\.]+)", after_rate)
+        if vat_amt_m:
+            vat_amount = parse_amount(vat_amt_m.group(1))
+
+    irpf_rate_m = re.search(r"irpf[^\d]*(\d{1,2}(?:\.\d+)?)\s*%", t, re.IGNORECASE)
+    irpf_rate   = float(irpf_rate_m.group(1)) if irpf_rate_m else 0.0
+
+    irpf_amount = 0.0
+    if irpf_rate_m:
+        after_irpf = t[irpf_rate_m.end():]
+        irpf_amt_m = re.search(r"-?\s*[€$]?\s*(\d[\d,\.]+)", after_irpf)
+        if irpf_amt_m:
+            irpf_amount = parse_amount(irpf_amt_m.group(1))
+
+    total_with_tax = total
 
     # Extract email first (used as fallback for supplier name)
     email_m  = re.search(r"[\w\.\-]+@[\w\.\-]+\.\w{2,}", t)
@@ -314,14 +319,14 @@ def extract_invoice_data(text: str, voucher_id: str = None, file_index: int = 0)
         "customer": {"company_name": customer_name, "address_line1": "N/A", "address_line2": "N/A", "Email": "N/A"},
         "invoice":  {"invoice_number": invoice_number, "invoice_date": invoice_date, "due_date": due_date, "amount_in_words": "N/A"},
         "items":    items,
-        "totals":   {"total": round(total, 2), "VAT_rate": vat_rate, "VAT_amount": round(vat_amount, 2), "Total_with_Tax": round(total_with_tax, 2)},
+        "totals":   {"base": round(base, 2), "total": round(total, 2), "VAT_rate": vat_rate, "VAT_amount": round(vat_amount, 2), "IRPF_rate": irpf_rate, "IRPF_amount": round(irpf_amount, 2), "Total_with_Tax": round(total_with_tax, 2)},
     }
 
 
 
 # ── Per-voucher worker ────────────────────────────────────────────────────────
 
-def process_single_voucher(voucher: dict, user_id: str) -> dict:
+def process_single_voucher(voucher: dict, user_id: str, period: str) -> dict:
     voucher_id = str(voucher["_id"])
     voucher_collection.update_one(
         {"_id": ObjectId(voucher_id)},
@@ -381,7 +386,7 @@ def process_single_voucher(voucher: dict, user_id: str) -> dict:
                 
                 ledger_result = ledger_collection.insert_one({
                     "user_id": user_id,
-                    "organization_id": user_id,  # Required for tax calculations
+                    "organization_id": user_id,
                     "voucher_id": voucher_id,
                     "file_name": file_name,
                     "data_type": "toon",
@@ -389,6 +394,7 @@ def process_single_voucher(voucher: dict, user_id: str) -> dict:
                     "ocr_text": text,
                     "invoice_data": invoice_data,
                     "processing_status": "success",
+                    "period": period,
                     # ── AI Modelo Analysis Results ────────────────────────
                     "ai_modelo_id": ai_modelo_result.get("modelo_id") if ai_modelo_result else None,
                     "ai_modelo_confidence": ai_modelo_result.get("confidence") if ai_modelo_result else None,
@@ -479,7 +485,7 @@ def process_single_voucher(voucher: dict, user_id: str) -> dict:
                 
                 ledger_result = ledger_collection.insert_one({
                     "user_id": user_id,
-                    "organization_id": user_id,  # Required for tax calculations
+                    "organization_id": user_id,
                     "voucher_id": voucher_id,
                     "file_url": file_url,
                     "s3_key": s3_key,
@@ -487,6 +493,7 @@ def process_single_voucher(voucher: dict, user_id: str) -> dict:
                     "ocr_text": cleaned_text,
                     "invoice_data": invoice_data,
                     "processing_status": "success",
+                    "period": period,
                     # ── AI Modelo Analysis Results ────────────────────────
                     "ai_modelo_id": ai_modelo_result.get("modelo_id") if ai_modelo_result else None,
                     "ai_modelo_confidence": ai_modelo_result.get("confidence") if ai_modelo_result else None,
@@ -572,7 +579,7 @@ def process_single_voucher(voucher: dict, user_id: str) -> dict:
 
 # ── Background job ────────────────────────────────────────────────────────────
 
-def process_vouchers_background(job_id: str, user_id: str, voucher_object_ids: list):
+def process_vouchers_background(job_id: str, user_id: str, voucher_object_ids: list, period: str):
     try:
         print(f"[OCR JOB] Starting {job_id}")
         ocr_jobs_collection.update_one(
@@ -587,7 +594,7 @@ def process_vouchers_background(job_id: str, user_id: str, voucher_object_ids: l
 
         job_results = []
         with ThreadPoolExecutor(max_workers=4) as executor:
-            futures = {executor.submit(process_single_voucher, v, user_id): v for v in vouchers}
+            futures = {executor.submit(process_single_voucher, v, user_id, period): v for v in vouchers}
             for future in as_completed(futures):
                 try:
                     result = future.result()
@@ -619,6 +626,7 @@ async def start_voucher_ocr(
     background_tasks: BackgroundTasks,
     user_id: str = Form(...),
     voucher_ids: str = Form(..., description="Comma-separated voucher IDs"),
+    period: str = Depends(validate_upload_window),
 ):
     voucher_id_list = [v.strip() for v in voucher_ids.split(",") if v.strip()]
     if not voucher_id_list:
@@ -632,9 +640,9 @@ async def start_voucher_ocr(
     if count == 0:
         raise HTTPException(status_code=404, detail="No vouchers found")
 
-    job    = ocr_jobs_collection.insert_one({"user_id": user_id, "voucher_ids": voucher_id_list, "status": "awaiting", "total_vouchers": count, "created_at": datetime.utcnow()})
+    job    = ocr_jobs_collection.insert_one({"user_id": user_id, "voucher_ids": voucher_id_list, "status": "awaiting", "total_vouchers": count, "period": period, "created_at": datetime.utcnow()})
     job_id = str(job.inserted_id)
-    background_tasks.add_task(process_vouchers_background, job_id, user_id, voucher_object_ids)
+    background_tasks.add_task(process_vouchers_background, job_id, user_id, voucher_object_ids, period)
 
     return {"message": "OCR processing started", "job_id": job_id, "user_id": user_id, "total_vouchers": count, "status": "awaiting", "check_status_url": f"/accounting/ocr/job/{job_id}"}
 

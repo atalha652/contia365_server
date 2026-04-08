@@ -62,52 +62,32 @@ def _in_quarter(invoice_date_str: str, start: datetime, end: datetime) -> bool:
 def _extract_amounts(entry: dict) -> dict:
     """
     Extract pre-VAT base, VAT amount, IRPF retention, and transaction type
-    from a ledger entry. No classification logic here — only arithmetic.
+    from a ledger entry. Reads directly from invoice_data.totals — no recalculation.
     """
-    import re
-    invoice_data = entry.get("invoice_data") or {}
-    totals       = invoice_data.get("totals") or {}
-    items        = invoice_data.get("items") or []
-    ocr_text     = entry.get("ocr_text") or ""
-    tx_type      = str(invoice_data.get("transaction_type", "expense")).lower()
+    invoice_data   = entry.get("invoice_data") or {}
+    totals         = invoice_data.get("totals") or {}
+    tx_type        = str(invoice_data.get("transaction_type", "expense")).lower()
 
+    # Read base directly — new entries have explicit "base" field
+    base_amount    = float(totals.get("base") or 0)
+    vat_amount     = float(totals.get("VAT_amount") or 0)
+    vat_rate       = float(totals.get("VAT_rate") or 0)
+    irpf_retention = float(totals.get("IRPF_amount") or 0)
     total_with_tax = float(totals.get("Total_with_Tax") or totals.get("total") or 0)
-    vat_rate       = float(totals.get("VAT_rate") or 21)
-    raw_vat        = float(totals.get("VAT_amount") or 0)
-    raw_total      = float(totals.get("total") or 0)
 
-    # Detect OCR bug: VAT_amount stores the rate instead of the monetary value
-    if raw_vat == vat_rate and raw_total > 0:
-        total_with_tax = raw_total
-        base_amount    = round(total_with_tax / (1 + vat_rate / 100), 2)
-        vat_amount     = round(total_with_tax - base_amount, 2)
-    else:
-        # Try line items first (most trustworthy pre-VAT base)
-        # Only use items_base if it's clearly less than total_with_tax (i.e. pre-VAT)
-        items_base = sum(float(i.get("subtotal") or i.get("unit_price") or 0) for i in items)
-        items_vat  = round(items_base * vat_rate / 100, 2)
-        items_is_pretax = items_base > 0 and items_base < total_with_tax and abs(items_base + items_vat - total_with_tax) < 1.0
-        if items_is_pretax:
-            base_amount = round(items_base, 2)
-            vat_amount  = items_vat
-        elif raw_vat > vat_rate and total_with_tax > 0:
-            vat_amount  = raw_vat
+    # Fallback for legacy entries that don't have the "base" field:
+    # only recalculate if base is missing AND vat_amount looks like a real amount (not the rate)
+    if base_amount == 0 and total_with_tax > 0:
+        if vat_amount > vat_rate and vat_rate > 0:
+            # vat_amount is a real monetary value
             base_amount = round(total_with_tax - vat_amount, 2)
-        elif total_with_tax > 0:
+        elif vat_rate > 0:
+            # vat_amount is missing or equals the rate (old OCR bug) — reverse calc
             base_amount = round(total_with_tax / (1 + vat_rate / 100), 2)
             vat_amount  = round(total_with_tax - base_amount, 2)
         else:
-            base_amount = 0.0
-            vat_amount  = 0.0
-
-    # IRPF retention — only if explicitly in OCR text
-    irpf_retention = 0.0
-    m = re.search(r"(?:retenci[oó]n|irpf)[^\d\-]*(-?\s*[\d,\.]+)", ocr_text, re.IGNORECASE)
-    if m:
-        try:
-            irpf_retention = abs(float(m.group(1).replace(",", "").replace(" ", "")))
-        except ValueError:
-            pass
+            # No VAT (e.g. rent) — base = total
+            base_amount = total_with_tax
 
     return {
         "transaction_type": tx_type,

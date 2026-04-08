@@ -28,6 +28,7 @@ from fastapi import APIRouter, File, UploadFile, Form, Depends, HTTPException
 from datetime import datetime
 from fastapi import Query
 from fastapi.responses import FileResponse
+from app.utils.period_guard import validate_upload_window
 # Load env variables
 load_dotenv()
 
@@ -97,7 +98,8 @@ async def upload_voucher(
     title: Optional[str] = Form(None, description="Optional title for the voucher"),
     description: Optional[str] = Form(None, description="Optional description for the voucher"),
     category: Optional[str] = Form(None, description="Optional category name for the voucher"),
-    transaction_type: Optional[str] = Form(None, description="Transaction type: 'credit' or 'debit'")
+    transaction_type: Optional[str] = Form(None, description="Transaction type: 'credit' or 'debit'"),
+    period: str = Depends(validate_upload_window),
 ):
     # Step 1: Validate all files
     for file in files:
@@ -112,9 +114,10 @@ async def upload_voucher(
     new_voucher = {
         "user_id": user_id,
         "status": "pending",
-        "OCR": "pending",  # OCR status field
+        "OCR": "pending",
+        "period": period,
         "created_at": datetime.utcnow(),
-        "files": []  # to store file metadata
+        "files": []
     }
     
     # Add optional fields if provided
@@ -165,6 +168,7 @@ async def upload_voucher(
         "message": "Voucher uploaded successfully",
         "voucher_id": voucher_id,
         "user_id": user_id,
+        "period": period,
         "files": file_records,
         "status": "pending",
         "OCR": "pending"
