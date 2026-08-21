@@ -101,7 +101,7 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
         return text
 
     # Scanned PDF — send whole PDF to OCR.space directly
-    print("[OCR] pdfplumber empty — sending to OCR.space")
+    print("[OCR] pdfplumber empty - sending to OCR.space")
     return ocr_with_ocrspace(pdf_bytes, file_ext="pdf")
 
 

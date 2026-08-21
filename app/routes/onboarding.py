@@ -13,8 +13,11 @@ import certifi
 from dotenv import load_dotenv
 
 from app.models.onboarding import (
-    UserTypeSelection, UserTypeInfo, OnboardingRequest, 
-    OnboardingResponse, OnboardingStatus, USER_TYPE_CONFIGS
+    UserTypeSelection, UserTypeInfo, OnboardingRequest,
+    OnboardingResponse, OnboardingStatus, USER_TYPE_CONFIGS,
+    CountrySelection, CountryInfo, CountrySelectRequest,
+    CountrySelectResponse, COUNTRY_CONFIGS,
+    SELECTABLE_USER_TYPES, USER_TYPE_CATALOG,
 )
 from app.routes.auth import get_current_user
 
@@ -35,31 +38,61 @@ router = APIRouter()
 @router.get("/user-types", response_model=List[UserTypeInfo])
 async def get_user_types():
     """
-    Get available user types for onboarding selection
-    Returns list of user types with descriptions and features
+    User types shown during onboarding.
+    Advisor is omitted so new users cannot pick Asesor; existing advisor
+    accounts stay valid in the DB and on login.
     """
-    user_types = [
-        UserTypeInfo(
-            id="freelancer",
-            name="Freelancer",
-            subtitle="Autónomo",
-            description="Individual freelancer or self-employed professional managing their own invoices and taxes.",
-        ),
-        UserTypeInfo(
-            id="company", 
-            name="Company",
-            subtitle="Empresa",
-            description="Business entity with employees and complex accounting and invoicing needs.",
-        ),
-        UserTypeInfo(
-            id="advisor",
-            name="Advisor", 
-            subtitle="Asesor",
-            description="Tax advisor or accountant managing finances and reports for multiple clients.",
+    return [USER_TYPE_CATALOG[t] for t in SELECTABLE_USER_TYPES]
+
+
+@router.get("/countries", response_model=List[CountryInfo])
+async def get_countries():
+    """Available countries for onboarding (Spain and Italy)."""
+    return [
+        CountryInfo(
+            id=cfg["id"],
+            name=cfg["name"],
+            subtitle=cfg["subtitle"],
+            currency=cfg["currency"],
+            tax_authority=cfg["tax_authority"],
         )
+        for cfg in COUNTRY_CONFIGS.values()
     ]
-    
-    return user_types
+
+
+@router.post("/select-country", response_model=CountrySelectResponse)
+async def select_country(
+    request: CountrySelectRequest,
+    current_user: dict = Depends(get_current_user)
+):
+    """
+    Save the user's operating country.
+    Does not complete onboarding; user type is still required next.
+    """
+    user_id = current_user["_id"]
+    country = request.country
+    country_config = COUNTRY_CONFIGS[country]
+
+    result = users_collection.update_one(
+        {"_id": ObjectId(user_id)},
+        {"$set": {
+            "country": country.value,
+            "country_name": country_config["name"],
+            "country_config": country_config,
+            "onboarding_step": "user_type_selection",
+            "updated_at": datetime.utcnow(),
+        }}
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return CountrySelectResponse(
+        message=f"Country '{country_config['name']}' selected successfully",
+        country=country.value,
+        country_name=country_config["name"],
+        next_step="user_type_selection",
+    )
 
 
 @router.post("/select-user-type", response_model=OnboardingResponse)
@@ -74,7 +107,20 @@ async def select_user_type(
     try:
         user_id = current_user["_id"]
         selected_type = request.user_type
-        
+        existing_type = current_user.get("user_type_selection")
+
+        # New users can only pick types from GET /user-types.
+        # Existing advisor accounts may keep (or re-save) advisor; do not map to white_label.
+        if selected_type not in SELECTABLE_USER_TYPES:
+            if not (
+                selected_type == UserTypeSelection.ADVISOR
+                and existing_type == UserTypeSelection.ADVISOR.value
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid user type. Choose freelancer or company.",
+                )
+
         # Get configuration for selected user type
         user_config = USER_TYPE_CONFIGS.get(selected_type, {})
         
@@ -117,7 +163,9 @@ async def select_user_type(
             user_type=selected_type.value,
             onboarding_completed=True,
         )
-        
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to update user type: {str(e)}")
 
@@ -130,20 +178,24 @@ async def get_onboarding_status(current_user: dict = Depends(get_current_user)):
     """
     user_id = current_user["_id"]
     onboarding_completed = current_user.get("onboarding_completed", False)
+    country_selected = current_user.get("country")
     user_type_selected = current_user.get("user_type_selection")
     completed_at = current_user.get("onboarding_completed_at")
-    
-    # Determine current step and next action
+
     if onboarding_completed:
         current_step = "completed"
         next_action = None
+    elif not country_selected:
+        current_step = "country_selection"
+        next_action = "Select your country to continue"
     else:
         current_step = "user_type_selection"
         next_action = "Select your user type to continue"
-    
+
     return OnboardingStatus(
         user_id=str(user_id),
         onboarding_completed=onboarding_completed,
+        country_selected=country_selected,
         user_type_selected=user_type_selected,
         current_step=current_step,
         completed_at=completed_at,
@@ -204,6 +256,8 @@ async def get_user_config(current_user: dict = Depends(get_current_user)):
         
     return {
         "user_type": user_type,
+        "country": current_user.get("country"),
         "config": user_config,
+        "country_config": current_user.get("country_config", {}),
         "onboarding_completed": current_user.get("onboarding_completed", False)
     }

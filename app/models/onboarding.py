@@ -25,14 +25,21 @@ class PyObjectId(str):
 
 
 class UserTypeSelection(str, Enum):
-    """Available user types for onboarding"""
+    """Stored user types. Advisor is legacy: not offered to new users."""
     FREELANCER = "freelancer"  # Autónomo
     COMPANY = "company"        # Business entity
-    ADVISOR = "advisor"        # Tax/Financial advisor
+    ADVISOR = "advisor"        # Legacy Asesor accounts only (not White Label)
+
+
+class CountrySelection(str, Enum):
+    """Supported operating countries (ISO 3166-1 alpha-2)."""
+    SPAIN = "ES"
+    ITALY = "IT"
 
 
 class OnboardingStep(str, Enum):
     """Onboarding process steps"""
+    COUNTRY_SELECTION = "country_selection"
     USER_TYPE_SELECTION = "user_type_selection"
     COMPLETED = "completed"
 
@@ -45,10 +52,49 @@ class UserTypeInfo(BaseModel):
     description: str
 
 
+# Shown in GET /user-types. Advisor is kept on the enum for existing accounts.
+SELECTABLE_USER_TYPES = (UserTypeSelection.FREELANCER, UserTypeSelection.COMPANY)
+
+USER_TYPE_CATALOG = {
+    UserTypeSelection.FREELANCER: UserTypeInfo(
+        id="freelancer",
+        name="Freelancer",
+        subtitle="Autónomo",
+        description="Individual freelancer or self-employed professional managing their own invoices and taxes.",
+    ),
+    UserTypeSelection.COMPANY: UserTypeInfo(
+        id="company",
+        name="Company",
+        subtitle="Empresa",
+        description="Business entity with employees and complex accounting and invoicing needs.",
+    ),
+    UserTypeSelection.ADVISOR: UserTypeInfo(
+        id="advisor",
+        name="Advisor",
+        subtitle="Asesor",
+        description="Tax advisor or accountant managing finances and reports for multiple clients.",
+    ),
+}
+
+
+class CountryInfo(BaseModel):
+    """Country option for frontend display"""
+    id: str
+    name: str
+    subtitle: str
+    currency: str
+    tax_authority: str
+
+
 class OnboardingRequest(BaseModel):
     """Request model for user type selection"""
     user_type: UserTypeSelection
     additional_info: Optional[Dict[str, Any]] = {}
+
+
+class CountrySelectRequest(BaseModel):
+    """Request model for country selection"""
+    country: CountrySelection
 
 
 class OnboardingResponse(BaseModel):
@@ -58,10 +104,19 @@ class OnboardingResponse(BaseModel):
     onboarding_completed: bool
 
 
+class CountrySelectResponse(BaseModel):
+    """Response after saving country"""
+    message: str
+    country: str
+    country_name: str
+    next_step: str
+
+
 class OnboardingStatus(BaseModel):
     """Model for checking onboarding status"""
     user_id: str
     onboarding_completed: bool
+    country_selected: Optional[str] = None
     user_type_selected: Optional[str] = None
     current_step: str
     completed_at: Optional[datetime] = None
@@ -88,4 +143,23 @@ USER_TYPE_CONFIGS = {
         "chart_of_accounts": "advisor_coa", 
         "tax_regime": "advisor"
     }
+}
+
+COUNTRY_CONFIGS = {
+    CountrySelection.SPAIN: {
+        "id": "ES",
+        "name": "Spain",
+        "subtitle": "España",
+        "currency": "EUR",
+        "tax_authority": "AEAT",
+        "invoice_format": "facturae",
+    },
+    CountrySelection.ITALY: {
+        "id": "IT",
+        "name": "Italy",
+        "subtitle": "Italia",
+        "currency": "EUR",
+        "tax_authority": "AdE",
+        "invoice_format": "fattura_pa",
+    },
 }

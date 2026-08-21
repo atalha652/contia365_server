@@ -124,7 +124,7 @@ async def get_ledger_by_user(
                 "data_type": "bank_transaction",
                 "ocr_text": entry.get("description", ""),
                 "invoice_data": {
-                    "transaction_type": "debit" if entry.get("entry_type") == "DEBIT" else "credit",
+                    "transaction_type": "income" if str(entry.get("entry_type", "")).lower() in ("debit", "income") else "expense",
                     "account": {
                         "account_code": entry.get("account_code", ""),
                         "account_name": entry.get("account_name", "")
@@ -271,7 +271,7 @@ async def export_ledger_pdf(
                 "data_type": "bank_transaction",
                 "ocr_text": entry.get("description", ""),
                 "invoice_data": {
-                    "transaction_type": "debit" if entry.get("entry_type") == "DEBIT" else "credit",
+                    "transaction_type": "income" if str(entry.get("entry_type", "")).lower() in ("debit", "income") else "expense",
                     "account": {
                         "account_code": entry.get("account_code", ""),
                         "account_name": entry.get("account_name", "")
@@ -570,3 +570,4 @@ async def delete_ledger_entry(
         raise
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Error deleting ledger entry: {str(e)}")
+

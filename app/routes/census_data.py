@@ -5,7 +5,7 @@ Upload PDF/Word Certificado de Situación Censal → extract → store in MongoD
 
 import os
 from datetime import datetime
-from typing import List
+from typing import List, Optional
 
 import certifi
 from bson import ObjectId
@@ -14,7 +14,9 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from pymongo import MongoClient
 
 from app.models.census_data import (
+    CensusDataBase,
     CensusDataCreate,
+    CensusDataUpdate,
     PlatformVerification,
 )
 from app.routes.auth import get_current_user
@@ -32,6 +34,7 @@ DB_NAME = os.getenv("DB_NAME")
 client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
 db = client[DB_NAME]
 census_collection = db["census_data"]
+users_collection = db["users"]
 
 # Compound index for duplicate detection (NIF/NIE + issue date across all users)
 census_collection.create_index(
@@ -48,6 +51,80 @@ ALLOWED_CONTENT_TYPES = {
     "application/msword",
 }
 MAX_FILE_SIZE_MB = 10
+
+
+def _record_response(doc: dict) -> dict:
+    doc["_id"] = str(doc["_id"])
+    return doc
+
+
+def _sync_user_tax_id(user_id, taxpayer_identity: Optional[dict]):
+    nif_nie = (taxpayer_identity or {}).get("nif_nie")
+    if nif_nie:
+        users_collection.update_one(
+            {"_id": user_id},
+            {"$set": {"tax_id": nif_nie, "dni_nie": nif_nie, "updated_at": datetime.utcnow()}},
+        )
+
+
+@router.post("/", status_code=201)
+async def save_census_profile(
+    payload: CensusDataBase,
+    current_user: dict = Depends(get_current_user),
+):
+    """Save Spain fiscal profile from the form (no file required)."""
+    user_id = current_user["_id"]
+    now = datetime.utcnow()
+    record = CensusDataCreate(
+        **payload.model_dump(exclude_unset=False),
+        user_id=str(user_id),
+        organization_id=str(current_user.get("organization_id", user_id)),
+        platform_verification=PlatformVerification(verification_status="PENDING"),
+    )
+    doc = record.model_dump(mode="json")
+    doc["created_at"] = now
+    doc["updated_at"] = now
+    doc["source"] = "form"
+
+    result = census_collection.insert_one(doc)
+    _sync_user_tax_id(user_id, doc.get("taxpayer_identity"))
+
+    saved = census_collection.find_one({"_id": result.inserted_id})
+    return {
+        "message": "Fiscal profile saved successfully.",
+        **_record_response(saved),
+    }
+
+
+@router.patch("/{record_id}")
+async def update_census_profile(
+    record_id: str,
+    payload: CensusDataUpdate,
+    current_user: dict = Depends(get_current_user),
+):
+    """Update fiscal fields after upload or after a previous form save."""
+    if not ObjectId.is_valid(record_id):
+        raise HTTPException(status_code=400, detail="Invalid record ID.")
+
+    existing = census_collection.find_one(
+        {"_id": ObjectId(record_id), "user_id": str(current_user["_id"])}
+    )
+    if not existing:
+        raise HTTPException(status_code=404, detail="Census record not found.")
+
+    updates = payload.model_dump(exclude_unset=True, mode="json")
+    if not updates:
+        raise HTTPException(status_code=400, detail="No fields to update.")
+
+    updates["updated_at"] = datetime.utcnow()
+    census_collection.update_one({"_id": ObjectId(record_id)}, {"$set": updates})
+    _sync_user_tax_id(current_user["_id"], updates.get("taxpayer_identity") or existing.get("taxpayer_identity"))
+
+    saved = census_collection.find_one({"_id": ObjectId(record_id)})
+    return {
+        "message": "Fiscal profile updated successfully.",
+        **_record_response(saved),
+    }
 
 
 @router.post("/upload", status_code=201)

@@ -296,6 +296,7 @@ async def signup(
         "user_type_selection": None,
         "onboarding_step": 0,
         "onboarding_completed_at": None,
+        "country": None,
     })
 
     # Handle company name in organization_info if provided
@@ -357,6 +358,7 @@ def login(user: UserLogin):
         "organization_info": db_user.get("organization_info", {}),
         "onboarding_completed": db_user.get("onboarding_completed", False),
         "user_type": db_user.get("user_type_selection", None),
+        "country": db_user.get("country", None),
         "census_data_uploaded": _has_census_data(db_user["_id"]),
         "created_at": db_user.get("created_at")
     }
@@ -385,9 +387,16 @@ def update_user_type(
     data: OnboardingUpdate,
     current_user: dict = Depends(get_current_user)
 ):
-    allowed = {UserType.freelancer, UserType.company, UserType.advisor}
-    if data.user_type not in allowed:
-        raise HTTPException(status_code=400, detail="Invalid onboarding type. Choose freelancer, company, or advisor.")
+    selectable = {UserType.freelancer, UserType.company}
+    existing = current_user.get("user_type_selection") or current_user.get("type")
+    already_advisor = existing == UserType.advisor.value
+
+    if data.user_type not in selectable:
+        if not (data.user_type == UserType.advisor and already_advisor):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid onboarding type. Choose freelancer or company.",
+            )
 
     users_collection.update_one(
         {"_id": current_user["_id"]},
@@ -565,3 +574,64 @@ def google_callback(code: str, state: str):
         raise HTTPException(status_code=500, detail=f"Google OAuth callback error: {str(e)}")
 
 
+
+
+# -------------------- Certificate Upload --------------------
+
+@router.post(
+    "/certificate",
+    summary="Upload user's .p12 digital certificate for AEAT VeriFactu signing",
+)
+async def upload_certificate(
+    certificate: UploadFile = File(..., description=".p12 / PKCS#12 certificate file"),
+    cert_password: str = Form(..., description="Password for the .p12 certificate"),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Stores the user's .p12 certificate encrypted in MongoDB.
+
+    Security model:
+    - The .p12 bytes are encrypted with Fernet (CERT_ENCRYPTION_KEY env var) before storage.
+    - The password is validated here to confirm the file is readable, then discarded.
+    - The password is NEVER stored — the user must provide it again at submit time.
+    - Only the authenticated user can upload/overwrite their own certificate.
+    """
+    from app.services.signature_service import encrypt_p12
+    from cryptography.hazmat.primitives.serialization.pkcs12 import load_key_and_certificates
+
+    if not certificate.filename.endswith((".p12", ".pfx")):
+        raise HTTPException(status_code=400, detail="File must be a .p12 or .pfx certificate")
+
+    p12_bytes = await certificate.read()
+    if len(p12_bytes) == 0:
+        raise HTTPException(status_code=400, detail="Empty certificate file")
+
+    # Validate the .p12 is readable with the provided password
+    try:
+        pw = cert_password.encode("utf-8") if cert_password else None
+        load_key_and_certificates(p12_bytes, pw)
+    except Exception:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid certificate or wrong password. Could not open the .p12 file.",
+        )
+
+    # Encrypt and store — password is NOT stored
+    encrypted = encrypt_p12(p12_bytes)
+
+    users_collection.update_one(
+        {"_id": current_user["_id"]},
+        {
+            "$set": {
+                "p12_encrypted": encrypted,
+                "certificate_uploaded_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+            }
+        },
+    )
+
+    return {
+        "message": "Certificate uploaded and stored securely. You will need to provide your password each time you submit an invoice.",
+        "filename": certificate.filename,
+        "size_bytes": len(p12_bytes),
+    }
