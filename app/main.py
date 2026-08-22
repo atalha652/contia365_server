@@ -3,7 +3,7 @@ from contextlib import asynccontextmanager
 from app.routes import (
     api, auth, project, report, accounting, voucher, ledger, ocr,
     gmail_api, ledgers, outlook_api, dashboard, bank_transactions, billing, modelo, onboarding,
-    census_data, tax_dashboard, tax_engine, tax_calculation, invoices, chatbot
+    census_data, tax_dashboard, tax_engine, tax_filings, tax_calculation, invoices, chatbot
 )
 from fastapi.middleware.cors import CORSMiddleware
 from pymongo import MongoClient
@@ -84,6 +84,9 @@ app.include_router(tax_calculation.router, prefix="/api")
 
 # Tax Calculation Engine routes
 app.include_router(tax_engine.router, prefix="/api")
+
+# Tax filing workflow routes
+app.include_router(tax_filings.router, prefix="/api")
 
 # Invoice routes
 app.include_router(invoices.router, prefix="/api")

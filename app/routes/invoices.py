@@ -23,7 +23,8 @@ from app.services.invoice_service import InvoiceService
 from app.services.facturae_service import FacturaeService, SellerInfo, VeriFactuService
 from app.services.signature_service import SignatureService, encrypt_p12, decrypt_p12
 from app.services.aeat_client import AeatClient, AeatSubmissionError
-from app.routes.auth import get_current_user
+from app.routes.auth import get_current_user, users_collection, census_collection
+from app.services.fiscal_profile_service import get_canonical_fiscal_profile
 
 logger = logging.getLogger(__name__)
 
@@ -234,21 +235,25 @@ def cancel_invoice(
 # ==================== COMPLIANCE ENDPOINTS ====================
 
 def _seller_from_user(current_user: dict) -> SellerInfo:
-    """Build SellerInfo from the authenticated user's profile."""
+    """Build seller identity from the canonical fiscal profile."""
     org = current_user.get("organization_info") or {}
-    census = current_user.get("census_data") or {}
+    profile = get_canonical_fiscal_profile(
+        users_collection, census_collection, current_user["_id"]
+    ) or {}
+    identity = profile.get("taxpayer_identity") or {}
+    address = identity.get("fiscal_address") or {}
     return SellerInfo(
-        tax_id=current_user.get("tax_id") or census.get("nif") or "UNKNOWN",
+        tax_id=identity.get("nif_nie") or current_user.get("tax_id") or "UNKNOWN",
         name=(
             org.get("company_name")
-            or census.get("razon_social")
+            or identity.get("full_name")
             or current_user.get("name")
             or "Unknown"
         ),
-        address=org.get("address") or census.get("domicilio_fiscal") or "",
-        postal_code=census.get("codigo_postal") or "",
-        city=census.get("municipio") or "",
-        province=census.get("provincia") or "",
+        address=address.get("address_line") or org.get("address") or "",
+        postal_code=address.get("postal_code") or "",
+        city=address.get("city") or "",
+        province=address.get("province") or "",
     )
 
 

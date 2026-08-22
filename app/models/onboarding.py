@@ -41,6 +41,7 @@ class OnboardingStep(str, Enum):
     """Onboarding process steps"""
     COUNTRY_SELECTION = "country_selection"
     USER_TYPE_SELECTION = "user_type_selection"
+    FISCAL_PROFILE = "fiscal_profile"
     COMPLETED = "completed"
 
 
@@ -98,10 +99,12 @@ class CountrySelectRequest(BaseModel):
 
 
 class OnboardingResponse(BaseModel):
-    """Response model for onboarding completion"""
+    """Response model for user type selection"""
     message: str
     user_type: str
     onboarding_completed: bool
+    current_step: Optional[str] = None
+    fiscal_profile_completed: bool = False
 
 
 class CountrySelectResponse(BaseModel):
@@ -113,11 +116,13 @@ class CountrySelectResponse(BaseModel):
 
 
 class OnboardingStatus(BaseModel):
-    """Model for checking onboarding status"""
+    """Single onboarding-status payload (login and GET /status must match)."""
     user_id: str
     onboarding_completed: bool
     country_selected: Optional[str] = None
     user_type_selected: Optional[str] = None
+    fiscal_profile_completed: bool = False
+    census_data_uploaded: bool = False
     current_step: str
     completed_at: Optional[datetime] = None
     next_action: Optional[str] = None

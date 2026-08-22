@@ -29,6 +29,8 @@ SECRET_KEY = os.getenv("SECRET_KEY", "ikingkhs23a")
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "600"))
 
+from app.services.onboarding_status import persist_computed_onboarding
+
 # -------------------- Database Connection --------------------
 client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
 db = client[DB_NAME]
@@ -328,8 +330,8 @@ async def signup(
 # -------------------- Login --------------------
 
 def _has_census_data(user_id: str) -> bool:
-    """Check if the user has uploaded at least one census document."""
-    return census_collection.find_one({"user_id": user_id}) is not None
+    """Legacy: any census row. Prefer fiscal_profile_completed from onboarding status."""
+    return census_collection.find_one({"user_id": str(user_id)}) is not None
 
 
 @router.post("/login")
@@ -338,14 +340,16 @@ def login(user: UserLogin):
     if not db_user or not bcrypt.checkpw(user.password.encode("utf-8"), db_user["password_hash"].encode("utf-8")):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    # Remove password from response
-    db_user["_id"] = str(db_user["_id"])
-    db_user.pop("password_hash", None)
-
     access_token = create_access_token(
         {"sub": str(db_user["_id"])},
         timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     )
+
+    status = persist_computed_onboarding(users_collection, census_collection, db_user)
+
+    # Remove password from response
+    db_user["_id"] = str(db_user["_id"])
+    db_user.pop("password_hash", None)
 
     return {
         "message": "User logged in successfully",
@@ -356,10 +360,13 @@ def login(user: UserLogin):
         "user_id": db_user["_id"],
         "tax_id": db_user["tax_id"],
         "organization_info": db_user.get("organization_info", {}),
-        "onboarding_completed": db_user.get("onboarding_completed", False),
+        "onboarding_completed": status["onboarding_completed"],
         "user_type": db_user.get("user_type_selection", None),
         "country": db_user.get("country", None),
-        "census_data_uploaded": _has_census_data(db_user["_id"]),
+        "fiscal_profile_completed": status["fiscal_profile_completed"],
+        "census_data_uploaded": status["census_data_uploaded"],
+        "current_step": status["current_step"],
+        "next_action": status["next_action"],
         "created_at": db_user.get("created_at")
     }
 
@@ -400,9 +407,23 @@ def update_user_type(
 
     users_collection.update_one(
         {"_id": current_user["_id"]},
-        {"$set": {"type": data.user_type, "onboarding_completed": True}}
+        {"$set": {
+            "type": data.user_type,
+            "user_type_selection": data.user_type.value,
+        }}
     )
-    return {"message": "User type updated successfully", "user_type": data.user_type}
+    status = persist_computed_onboarding(
+        users_collection,
+        census_collection,
+        {**current_user, "user_type_selection": data.user_type.value, "type": data.user_type},
+    )
+    return {
+        "message": "User type updated successfully",
+        "user_type": data.user_type,
+        "onboarding_completed": status["onboarding_completed"],
+        "current_step": status["current_step"],
+        "fiscal_profile_completed": status["fiscal_profile_completed"],
+    }
 
 # Example protected route
 @router.get("/dashboard")

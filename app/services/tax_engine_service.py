@@ -114,6 +114,13 @@ class TaxEngineService:
     def __init__(self):
         self.repo = TaxEngineRepository()
 
+    def _require_applicable_modelo(self, user_id: str, modelo: str) -> None:
+        applicable = self.repo.get_applicable_modelos(user_id)
+        if modelo not in applicable:
+            raise ValueError(
+                f"Modelo {modelo} is not applicable under the canonical fiscal profile"
+            )
+
     def _get_entries_for_modelo(
         self, user_id: str, organization_id: str,
         modelo_id: Optional[str], start: datetime, end: datetime
@@ -178,6 +185,7 @@ class TaxEngineService:
 
         vatPayable = outputVAT (income) - inputVAT (expense)
         """
+        self._require_applicable_modelo(user_id, "303")
         start, end = _quarter_date_range(year, quarter)
         raw        = self._get_entries_for_modelo(user_id, organization_id, modelo_id, start, end)
         entries    = self._filter_by_invoice_date(raw, start, end)
@@ -230,6 +238,7 @@ class TaxEngineService:
         taxableIncome = income - expenses
         irpfPayable   = max(0, taxableIncome × 20%) - already_withheld
         """
+        self._require_applicable_modelo(user_id, "130")
         start, end = _quarter_date_range(year, quarter)
         raw        = self._get_entries_for_modelo(user_id, organization_id, modelo_id, start, end)
         entries    = self._filter_by_invoice_date(raw, start, end)
@@ -291,6 +300,7 @@ class TaxEngineService:
         withholding_payable = sum of irpf_retention values found in OCR text.
         """
         from app.models.tax_engine import Modelo115Results, Modelo115Response
+        self._require_applicable_modelo(user_id, "115")
         start, end = _quarter_date_range(year, quarter)
         raw     = self._get_entries_for_modelo(user_id, organization_id, modelo_id, start, end)
         entries = self._filter_by_invoice_date(raw, start, end)
@@ -342,6 +352,7 @@ class TaxEngineService:
         withholding_payable = sum of all irpf_retention values.
         """
         from app.models.tax_engine import Modelo111Results, Modelo111Response
+        self._require_applicable_modelo(user_id, "111")
         start, end = _quarter_date_range(year, quarter)
         raw     = self._get_entries_for_modelo(user_id, organization_id, modelo_id, start, end)
         entries = self._filter_by_invoice_date(raw, start, end)
@@ -389,6 +400,7 @@ class TaxEngineService:
         quarterly_payments already made.
         """
         from app.models.tax_engine import Modelo390Results, Modelo390Response, Quarter
+        self._require_applicable_modelo(user_id, "390")
         start = datetime(year, 1, 1)
         end   = datetime(year, 12, 31, 23, 59, 59)
         raw     = self._get_entries_for_modelo(user_id, organization_id, modelo_id, start, end)
@@ -450,6 +462,7 @@ class TaxEngineService:
         balance_payable = annual_irpf - quarterly_130_payments - total_withheld
         """
         from app.models.tax_engine import Modelo190Results, Modelo190Response, Quarter
+        self._require_applicable_modelo(user_id, "190")
         start = datetime(year, 1, 1)
         end   = datetime(year, 12, 31, 23, 59, 59)
         raw     = self._get_entries_for_modelo(user_id, organization_id, modelo_id, start, end)

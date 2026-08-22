@@ -13,6 +13,10 @@ from pymongo import MongoClient, ASCENDING, DESCENDING
 from dotenv import load_dotenv
 
 from app.models.tax_engine import TaxReport, TaxReportStatus, Quarter
+from app.services.fiscal_profile_service import (
+    applicable_modelos,
+    get_canonical_fiscal_profile,
+)
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -23,11 +27,19 @@ class TaxEngineRepository:
         self.client = MongoClient(os.getenv("MONGO_URI"), tlsCAFile=certifi.where())
         self.db = self.client[os.getenv("DB_NAME")]
         self.tax_reports = self.db["tax_reports"]
+        self.users = self.db["users"]
+        self.census_data = self.db["census_data"]
         # OCR-processed invoices live in "ledger" (written by ocr.py)
         self.ledger = self.db["ledger"]
         # Double-entry accounting entries live in "ledger_entries" (written by accounting_repo.py)
         self.ledger_entries = self.db["ledger_entries"]
         self._create_indexes()
+
+    def get_applicable_modelos(self, user_id: str) -> set[str]:
+        profile = get_canonical_fiscal_profile(
+            self.users, self.census_data, user_id
+        )
+        return applicable_modelos(profile)
 
     def _create_indexes(self):
         try:

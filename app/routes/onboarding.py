@@ -20,6 +20,7 @@ from app.models.onboarding import (
     SELECTABLE_USER_TYPES, USER_TYPE_CATALOG,
 )
 from app.routes.auth import get_current_user
+from app.services.onboarding_status import persist_computed_onboarding
 
 # Load environment variables
 load_dotenv()
@@ -30,6 +31,7 @@ DB_NAME = os.getenv("DB_NAME")
 client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
 db = client[DB_NAME]
 users_collection = db["users"]
+census_collection = db["census_data"]
 
 # Router setup
 router = APIRouter()
@@ -87,6 +89,12 @@ async def select_country(
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="User not found")
 
+    persist_computed_onboarding(
+        users_collection,
+        census_collection,
+        {**current_user, "country": country.value},
+    )
+
     return CountrySelectResponse(
         message=f"Country '{country_config['name']}' selected successfully",
         country=country.value,
@@ -121,47 +129,42 @@ async def select_user_type(
                     detail="Invalid user type. Choose freelancer or company.",
                 )
 
-        # Get configuration for selected user type
         user_config = USER_TYPE_CONFIGS.get(selected_type, {})
-        
-        # Update user document in database
+
         update_data = {
             "user_type_selection": selected_type.value,
-            "onboarding_completed": True,
-            "onboarding_completed_at": datetime.utcnow(),
-            "onboarding_step": "completed",
             "updated_at": datetime.utcnow(),
-            "user_config": user_config
+            "user_config": user_config,
         }
-        
-        # If user has company name, update organization type based on selection
+
         if selected_type == UserTypeSelection.COMPANY and current_user.get("organization_info"):
             update_data["organization_info.type"] = "company"
             update_data["type"] = "organization"
         elif selected_type == UserTypeSelection.FREELANCER:
             update_data["type"] = "individual"
         elif selected_type == UserTypeSelection.ADVISOR:
-            update_data["type"] = "organization"  # Advisors are treated as organizations
-            
+            update_data["type"] = "organization"
+
         result = users_collection.update_one(
             {"_id": ObjectId(user_id)},
             {"$set": update_data}
         )
-        
+
         if result.matched_count == 0:
             raise HTTPException(status_code=404, detail="User not found")
-            
-        # Determine redirect based on user type
-        redirect_mapping = {
-            UserTypeSelection.FREELANCER: "/dashboard/freelancer",
-            UserTypeSelection.COMPANY: "/dashboard/company", 
-            UserTypeSelection.ADVISOR: "/dashboard/advisor"
-        }
-        
+
+        status = persist_computed_onboarding(
+            users_collection,
+            census_collection,
+            {**current_user, "user_type_selection": selected_type.value},
+        )
+
         return OnboardingResponse(
             message=f"User type '{selected_type.value}' selected successfully",
             user_type=selected_type.value,
-            onboarding_completed=True,
+            onboarding_completed=status["onboarding_completed"],
+            current_step=status["current_step"],
+            fiscal_profile_completed=status["fiscal_profile_completed"],
         )
 
     except HTTPException:
@@ -173,34 +176,13 @@ async def select_user_type(
 @router.get("/status", response_model=OnboardingStatus)
 async def get_onboarding_status(current_user: dict = Depends(get_current_user)):
     """
-    Check current user's onboarding status
-    Returns whether onboarding is completed and current step
+    Authoritative onboarding status. Fiscal completion is based on form fields
+    (NIF/NIE, IAE, VAT), not on whether a census file was uploaded.
     """
-    user_id = current_user["_id"]
-    onboarding_completed = current_user.get("onboarding_completed", False)
-    country_selected = current_user.get("country")
-    user_type_selected = current_user.get("user_type_selection")
-    completed_at = current_user.get("onboarding_completed_at")
-
-    if onboarding_completed:
-        current_step = "completed"
-        next_action = None
-    elif not country_selected:
-        current_step = "country_selection"
-        next_action = "Select your country to continue"
-    else:
-        current_step = "user_type_selection"
-        next_action = "Select your user type to continue"
-
-    return OnboardingStatus(
-        user_id=str(user_id),
-        onboarding_completed=onboarding_completed,
-        country_selected=country_selected,
-        user_type_selected=user_type_selected,
-        current_step=current_step,
-        completed_at=completed_at,
-        next_action=next_action
+    status = persist_computed_onboarding(
+        users_collection, census_collection, current_user
     )
+    return OnboardingStatus(**status)
 
 
 @router.post("/skip")
@@ -216,27 +198,32 @@ async def skip_onboarding(current_user: dict = Depends(get_current_user)):
         
         update_data = {
             "user_type_selection": UserTypeSelection.FREELANCER.value,
-            "onboarding_completed": True,
-            "onboarding_completed_at": datetime.utcnow(),
-            "onboarding_step": "completed",
             "updated_at": datetime.utcnow(),
             "user_config": default_config,
-            "onboarding_skipped": True
+            "onboarding_skipped": True,
         }
-        
+
         result = users_collection.update_one(
             {"_id": ObjectId(user_id)},
             {"$set": update_data}
         )
-        
+
         if result.matched_count == 0:
             raise HTTPException(status_code=404, detail="User not found")
-            
+
+        status = persist_computed_onboarding(
+            users_collection,
+            census_collection,
+            {**current_user, "user_type_selection": UserTypeSelection.FREELANCER.value},
+        )
+
         return {
             "message": "Onboarding skipped successfully",
             "user_type": UserTypeSelection.FREELANCER.value,
-            "redirect_to": "/dashboard",
-            "note": "Default freelancer configuration applied. You can change this later in settings."
+            "onboarding_completed": status["onboarding_completed"],
+            "current_step": status["current_step"],
+            "fiscal_profile_completed": status["fiscal_profile_completed"],
+            "note": "Default freelancer configuration applied. Spain users still need the fiscal profile.",
         }
         
     except Exception as e:
@@ -253,11 +240,17 @@ async def get_user_config(current_user: dict = Depends(get_current_user)):
     
     if not user_type:
         raise HTTPException(status_code=400, detail="User type not selected")
-        
+
+    status = persist_computed_onboarding(
+        users_collection, census_collection, current_user
+    )
     return {
         "user_type": user_type,
         "country": current_user.get("country"),
         "config": user_config,
         "country_config": current_user.get("country_config", {}),
-        "onboarding_completed": current_user.get("onboarding_completed", False)
+        "onboarding_completed": status["onboarding_completed"],
+        "current_step": status["current_step"],
+        "fiscal_profile_completed": status["fiscal_profile_completed"],
+        "census_data_uploaded": status["census_data_uploaded"],
     }

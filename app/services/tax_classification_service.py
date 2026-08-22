@@ -37,6 +37,7 @@ from typing import List, Dict, Optional
 
 from bson import ObjectId
 from pymongo import MongoClient
+from app.services.fiscal_profile_service import get_canonical_fiscal_profile
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -166,6 +167,7 @@ class TaxClassificationService:
         db = client[os.getenv("DB_NAME")]
         self._modelos     = db["modelos"]
         self._census      = db["census_data"]
+        self._users       = db["users"]
         self._ledger      = db["ledger"]
 
     # ─────────────────── public API ──────────────────────────────────────────
@@ -210,11 +212,6 @@ class TaxClassificationService:
         entries = list(self._ledger.find({
             "user_id": user_id,
             "processing_status": "success",
-            # Include: no classification OR classification with empty modelo_ids
-            "$or": [
-                {"tax_classification": {"$exists": False}},
-                {"tax_classification.modelo_ids": {"$size": 0}},
-            ]
         }))
         for entry in entries:
             stats["processed"] += 1
@@ -279,13 +276,12 @@ class TaxClassificationService:
 
     def _get_user_applicable_modelo_nos(self, user_id: str) -> List[str]:
         """
-        Read the user's latest census_data record and return the list of
+        Read the user's canonical fiscal profile and return the list of
         modelo numbers from periodic_tax_obligations.
         These are the ONLY modelos valid for this user.
         """
-        record = self._census.find_one(
-            {"user_id": user_id},
-            sort=[("created_at", -1)]
+        record = get_canonical_fiscal_profile(
+            self._users, self._census, user_id
         )
         if not record:
             return []

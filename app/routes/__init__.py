@@ -2,6 +2,6 @@
 from . import (
     api, auth, project, report, accounting, voucher, ledger, ocr,
     gmail_api, ledgers, outlook_api, dashboard, bank_transactions,
-    billing, modelo, onboarding, census_data, tax_dashboard, tax_engine,
+    billing, modelo, onboarding, census_data, tax_dashboard, tax_engine, tax_filings,
     invoices, chatbot,
 )

@@ -62,6 +62,8 @@ async def calculate_modelo_303(
         return _engine.calculate_modelo_303(
             user_id, org_id, body.year, Quarter(body.quarter), body.modelo_id
         )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -82,6 +84,8 @@ async def calculate_modelo_130(
         return _engine.calculate_modelo_130(
             user_id, org_id, body.year, Quarter(body.quarter), body.modelo_id
         )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -125,6 +129,8 @@ async def calculate_modelo_115(
         return _engine.calculate_modelo_115(
             user_id, org_id, body.year, Quarter(body.quarter), body.modelo_id
         )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -142,6 +148,8 @@ async def calculate_modelo_111(
         return _engine.calculate_modelo_111(
             user_id, org_id, body.year, Quarter(body.quarter), body.modelo_id
         )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -161,6 +169,8 @@ async def calculate_modelo_390(
     org_id  = str(current_user.get("organization_id", user_id))
     try:
         return _engine.calculate_modelo_390(user_id, org_id, body.year, body.modelo_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -178,6 +188,8 @@ async def calculate_modelo_190(
     org_id  = str(current_user.get("organization_id", user_id))
     try:
         return _engine.calculate_modelo_190(user_id, org_id, body.year, body.modelo_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

@@ -18,6 +18,7 @@ from bson import ObjectId
 import certifi
 from dotenv import load_dotenv
 from datetime import datetime, date, timedelta
+from app.services.fiscal_profile_service import get_canonical_fiscal_profile
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -297,13 +298,27 @@ def build_user_context(user: dict) -> str:
     user_id = str(user["_id"])
     org_info = user.get("organization_info") or {}
     org_id = org_info.get("organization_id") or user_id
+    fiscal_profile = get_canonical_fiscal_profile(
+        _db["users"], _db["census_data"], user["_id"]
+    ) or {}
+    fiscal_identity = fiscal_profile.get("taxpayer_identity") or {}
+    registration = fiscal_profile.get("professional_registration") or {}
 
     lines: List[str] = []
 
     # ── User identity ──────────────────────────────────────────────────────
     lines.append(f"User: {user.get('name', 'Unknown')} ({user.get('email', '')})")
     lines.append(f"Company: {user.get('company_name') or org_info.get('company_name') or 'N/A'}")
-    lines.append(f"Tax ID (NIF): {user.get('tax_id') or 'N/A'}")
+    lines.append(
+        f"Tax ID (NIF): {fiscal_identity.get('nif_nie') or user.get('tax_id') or 'N/A'}"
+    )
+    lines.append(f"VAT regime: {registration.get('vat_regime') or 'N/A'}")
+    iae_codes = [
+        str(activity.get("code"))
+        for activity in (registration.get("economic_activities") or [])
+        if activity.get("code")
+    ]
+    lines.append(f"IAE codes: {', '.join(iae_codes) if iae_codes else 'N/A'}")
     lines.append(f"User type: {user.get('type', 'N/A')}")
 
     # ── Invoice summary ────────────────────────────────────────────────────
