@@ -89,13 +89,41 @@ def _extract_amounts(entry: dict) -> dict:
             # No VAT (e.g. rent) — base = total
             base_amount = total_with_tax
 
+    # Infer rate from amounts when OCR omitted VAT_rate
+    if vat_rate <= 0 and base_amount > 0 and vat_amount > 0:
+        vat_rate = round((vat_amount / base_amount) * 100, 2)
+
     return {
         "transaction_type": tx_type,
         "base_amount":      base_amount,
         "vat_amount":       vat_amount,
+        "vat_rate":         vat_rate,
         "irpf_retention":   irpf_retention,
         "total_with_tax":   total_with_tax,
     }
+
+
+_STANDARD_VAT_RATES = (21, 10, 4, 0)
+
+
+def _empty_vat_by_rate() -> dict:
+    return {
+        str(rate): {
+            "output_base": 0.0,
+            "output_vat": 0.0,
+            "input_base": 0.0,
+            "input_vat": 0.0,
+        }
+        for rate in _STANDARD_VAT_RATES
+    }
+
+
+def _bucket_vat_rate(rate: float) -> str:
+    """Snap a stored rate onto the Spanish 21 / 10 / 4 / 0 split."""
+    if rate is None or rate <= 0:
+        return "0"
+    nearest = min(_STANDARD_VAT_RATES, key=lambda standard: abs(standard - rate))
+    return str(nearest)
 
 
 def _is_income(tx_type: str) -> bool:
@@ -191,6 +219,7 @@ class TaxEngineService:
         entries    = self._filter_by_invoice_date(raw, start, end)
 
         totals = Modelo303Results()
+        vat_by_rate = _empty_vat_by_rate()
         count  = 0
 
         for entry in entries:
@@ -198,18 +227,27 @@ class TaxEngineService:
             if a["total_with_tax"] == 0:
                 continue
             count += 1
+            bucket = vat_by_rate[_bucket_vat_rate(a["vat_rate"])]
             if _is_income(a["transaction_type"]):
                 totals.total_sales += a["base_amount"]
                 totals.output_vat  += a["vat_amount"]
+                bucket["output_base"] += a["base_amount"]
+                bucket["output_vat"]  += a["vat_amount"]
             else:
                 totals.total_expenses += a["base_amount"]
                 totals.input_vat      += a["vat_amount"]
+                bucket["input_base"] += a["base_amount"]
+                bucket["input_vat"]  += a["vat_amount"]
 
         totals.total_sales    = round(totals.total_sales, 2)
         totals.total_expenses = round(totals.total_expenses, 2)
         totals.output_vat     = round(totals.output_vat, 2)
         totals.input_vat      = round(totals.input_vat, 2)
         totals.vat_payable    = round(totals.output_vat - totals.input_vat, 2)
+        totals.vat_by_rate = {
+            rate: {field: round(value, 2) for field, value in bucket.items()}
+            for rate, bucket in vat_by_rate.items()
+        }
 
         report = TaxReport(
             user_id=user_id, organization_id=organization_id,

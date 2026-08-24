@@ -4,7 +4,7 @@ Covers: Modelo 303 (IVA) and Modelo 130 (IRPF)
 """
 
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Dict
 from enum import Enum
 from pydantic import BaseModel, Field, ConfigDict
 from bson import ObjectId
@@ -30,12 +30,20 @@ class Quarter(str, Enum):
 
 # ─────────────────────── Modelo 303 (IVA / VAT) ─────────────────────────────
 
+class VatByRateBucket(BaseModel):
+    output_base: float = 0.0
+    output_vat: float = 0.0
+    input_base: float = 0.0
+    input_vat: float = 0.0
+
+
 class Modelo303Results(BaseModel):
     total_sales: float = 0.0          # Base imponible ventas
     total_expenses: float = 0.0       # Base imponible compras
     output_vat: float = 0.0           # IVA repercutido (on sales)
     input_vat: float = 0.0            # IVA soportado (on purchases)
     vat_payable: float = 0.0          # output_vat - input_vat (positive = pay, negative = refund)
+    vat_by_rate: Dict[str, VatByRateBucket] = Field(default_factory=dict)
 
 
 # ─────────────────────── Modelo 130 (IRPF) ──────────────────────────────────

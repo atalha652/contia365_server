@@ -37,11 +37,16 @@ def is_period_open(target_period: str) -> bool:
     return False
 
 
-async def validate_upload_window(period: str = Form(..., description="Tax period in YYYY-MM format, e.g. '2026-03'")):
-    """FastAPI dependency — raises 403 if the period is closed for uploads."""
+def require_open_period(period: str) -> str:
+    """Raise 403 if the YYYY-MM period is closed. Safe to call from JSON or Form routes."""
     if not is_period_open(period):
         raise HTTPException(
             status_code=403,
             detail=f"The tax period {period} is closed for uploads. Deadlines are the 10th of the following month."
         )
     return period
+
+
+async def validate_upload_window(period: str = Form(..., description="Tax period in YYYY-MM format, e.g. '2026-03'")):
+    """FastAPI dependency — raises 403 if the period is closed for uploads."""
+    return require_open_period(period)

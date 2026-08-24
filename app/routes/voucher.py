@@ -28,7 +28,9 @@ from fastapi import APIRouter, File, UploadFile, Form, Depends, HTTPException
 from datetime import datetime
 from fastapi import Query
 from fastapi.responses import FileResponse
-from app.utils.period_guard import validate_upload_window
+from app.utils.period_guard import require_open_period, validate_upload_window
+from app.services.tax_classification_service import TaxClassificationService
+from app.services.manual_voucher import ManualVoucherCreate, build_manual_invoice_data, manual_ocr_text
 # Load env variables
 load_dotenv()
 
@@ -45,7 +47,9 @@ DB_NAME = os.getenv("DB_NAME")
 client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
 db = client[DB_NAME]
 voucher_collection = db["voucher"]
+ledger_collection = db["ledger"]
 ocr_collection = db["ocr"]  # Replace 'db' with your actual DB object
+_tax_classifier = TaxClassificationService()
 AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 OPENAI_KEY = os.getenv("OPENAI_API_KEY")
@@ -185,6 +189,101 @@ async def upload_voucher(
         response["transaction_type"] = transaction_type
     
     return response
+
+
+@router.post("/manual", status_code=201)
+async def create_manual_voucher(body: ManualVoucherCreate):
+    """
+    JSON-only voucher create. Does not accept files and does not run OCR.
+    Scan uploads stay on POST /accounting/voucher/upload.
+    """
+    period = require_open_period(body.period)
+    invoice_data = build_manual_invoice_data(body)
+    now = datetime.utcnow()
+    synthetic_text = manual_ocr_text(invoice_data)
+
+    new_voucher = {
+        "user_id": body.user_id,
+        "status": "pending",
+        "OCR": "not_applicable",
+        "source": "manual",
+        "period": period,
+        "transaction_type": body.transaction_type,
+        "files": [],
+        "invoice_data": invoice_data,
+        "created_at": now,
+    }
+    if body.title:
+        new_voucher["title"] = body.title
+    if body.description:
+        new_voucher["description"] = body.description
+    if body.category:
+        new_voucher["category"] = body.category
+
+    result = voucher_collection.insert_one(new_voucher)
+    voucher_id = str(result.inserted_id)
+
+    totals = invoice_data["totals"]
+    nested_tx = invoice_data["transaction_type"]
+    account_code = "4770" if nested_tx == "income" else "4720"
+    entry_type = "credit" if nested_tx == "income" else "debit"
+    supplier_name = invoice_data["supplier"].get("business_name") or "Unknown"
+
+    ledger_result = ledger_collection.insert_one({
+        "user_id": body.user_id,
+        "organization_id": body.user_id,
+        "voucher_id": voucher_id,
+        "data_type": "manual",
+        "invoice_data": invoice_data,
+        "ocr_text": synthetic_text,
+        "processing_status": "success",
+        "period": period,
+        "account_code": account_code,
+        "entry_type": entry_type,
+        "amount": totals["Total_with_Tax"],
+        "transaction_date": now,
+        "description": body.title or f"Manual invoice from {supplier_name}",
+        "created_at": now,
+    })
+    ledger_id = str(ledger_result.inserted_id)
+
+    try:
+        _tax_classifier.classify_ledger_entry(ledger_id, body.user_id)
+    except Exception as ce:
+        print(f"[ClassificationLayer] manual entry {ledger_id}: {ce}")
+
+    tax_tx_id = None
+    try:
+        from app.services.tax_calculation_service import TaxCalculationService
+        tax_tx_id = TaxCalculationService(db).create_tax_transaction_from_ledger(
+            ledger_entry_id=ledger_id,
+            organization_id=body.user_id,
+        )
+    except Exception as te:
+        print(f"[TaxCalc] manual entry {ledger_id}: {te}")
+
+    voucher_collection.update_one(
+        {"_id": result.inserted_id},
+        {"$set": {"ledger_id": ledger_id}},
+    )
+
+    return {
+        "message": "Manual voucher created successfully",
+        "voucher_id": voucher_id,
+        "ledger_id": ledger_id,
+        "tax_transaction_id": tax_tx_id,
+        "user_id": body.user_id,
+        "period": period,
+        "source": "manual",
+        "status": "pending",
+        "OCR": "not_applicable",
+        "transaction_type": body.transaction_type,
+        "title": body.title,
+        "description": body.description,
+        "category": body.category,
+        "invoice_data": invoice_data,
+        "files": [],
+    }
 
 
 @router.get("/awaiting-approval")
