@@ -39,6 +39,12 @@ class TaxFilingRepository:
             {"_id": ObjectId(filing_id), "user_id": str(user_id)}
         )
 
+    def get_by_id_any(self, filing_id: str) -> Optional[dict]:
+        """Load by id only so owner checks can return 403 instead of 404."""
+        if not ObjectId.is_valid(filing_id):
+            return None
+        return self.filings.find_one({"_id": ObjectId(filing_id)})
+
     def get_by_period(
         self, user_id: str, modelo: str, year: int, period_key: str
     ) -> Optional[dict]:

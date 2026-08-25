@@ -15,7 +15,7 @@ to classify existing entries.
 
 import logging
 from datetime import datetime
-from typing import Tuple, List, Optional
+from typing import Tuple, List, Optional, Union
 
 from app.models.tax_engine import (
     Quarter, TaxReport, TaxReportStatus,
@@ -23,6 +23,8 @@ from app.models.tax_engine import (
     Modelo303Response, Modelo130Response,
 )
 from app.repos.tax_engine_repo import TaxEngineRepository
+from app.repos.tax_percipient_repo import TaxPercipientRepository
+from app.services.tax_period import resolve_tax_period
 
 logger = logging.getLogger(__name__)
 
@@ -139,8 +141,30 @@ class TaxEngineService:
     and aggregates financial totals per modelo.
     """
 
-    def __init__(self):
-        self.repo = TaxEngineRepository()
+    def __init__(self, repo=None, percipient_repo=None):
+        self.repo = repo if repo is not None else TaxEngineRepository()
+        self.percipient_repo = (
+            percipient_repo if percipient_repo is not None else TaxPercipientRepository()
+        )
+
+    def _percipient_lines(self, user_id: str, year: int, quarter: Optional[str] = None) -> list[dict]:
+        rows = self.percipient_repo.list(user_id, year, quarter)
+        lines = []
+        for row in rows:
+            lines.append({
+                "nif": row.get("nif"),
+                "full_name": row.get("full_name"),
+                "perception_key": row.get("perception_key") or "G",
+                "perception_subkey": row.get("perception_subkey") or "01",
+                "year": row.get("year"),
+                "quarter": row.get("quarter"),
+                "base_amount": round(float(row.get("base_amount") or 0), 2),
+                "withheld_amount": round(float(row.get("withheld_amount") or 0), 2),
+                "in_kind": bool(row.get("in_kind")),
+                "province_code": row.get("province_code"),
+                "kind": row.get("kind") or "professional",
+            })
+        return lines
 
     def _require_applicable_modelo(self, user_id: str, modelo: str) -> None:
         applicable = self.repo.get_applicable_modelos(user_id)
@@ -206,15 +230,28 @@ class TaxEngineService:
 
     def calculate_modelo_303(
         self, user_id: str, organization_id: str,
-        year: int, quarter: Quarter, modelo_id: str
+        year: int, quarter: Optional[Union[Quarter, str]] = None,
+        modelo_id: Optional[str] = None,
+        month: Optional[int] = None,
+        period_key: Optional[str] = None,
     ) -> Modelo303Response:
         """
         Aggregate VAT for entries pre-classified as belonging to modelo_id.
 
         vatPayable = outputVAT (income) - inputVAT (expense)
+        Monthly (REDEME) filers pass month 1-12; quarterly filers pass Q1-Q4.
         """
         self._require_applicable_modelo(user_id, "303")
-        start, end = _quarter_date_range(year, quarter)
+        periodicity = self.repo.get_modelo_periodicity(user_id, "303")
+        period = resolve_tax_period(
+            year=year,
+            periodicity=periodicity,
+            quarter=quarter,
+            month=month,
+            period_key=period_key,
+            modelo="303",
+        )
+        start, end = period.date_range()
         raw        = self._get_entries_for_modelo(user_id, organization_id, modelo_id, start, end)
         entries    = self._filter_by_invoice_date(raw, start, end)
 
@@ -251,7 +288,9 @@ class TaxEngineService:
 
         report = TaxReport(
             user_id=user_id, organization_id=organization_id,
-            modelo="303", year=year, quarter=quarter,
+            modelo="303", year=year,
+            quarter=period.report_quarter,
+            period_key=period.period_key,
             results=totals.model_dump(),
             status=TaxReportStatus.DRAFT,
             transactions_count=count,
@@ -259,7 +298,11 @@ class TaxEngineService:
         self.repo.upsert_tax_report(report)
 
         return Modelo303Response(
-            period=f"{quarter} {year}", year=year, quarter=quarter,
+            period=period.label, year=year,
+            quarter=period.quarter,
+            month=period.month,
+            period_key=period.period_key,
+            redeme=period.is_redeme,
             totals=totals, status=TaxReportStatus.DRAFT,
             transactions_count=count,
             calculated_at=datetime.utcnow().isoformat(),
@@ -299,6 +342,12 @@ class TaxEngineService:
         totals.total_expenses        = round(totals.total_expenses, 2)
         totals.taxable_income        = round(totals.total_income - totals.total_expenses, 2)
         totals.irpf_already_withheld = round(totals.irpf_already_withheld, 2)
+        prior = 0.0
+        for report in self.repo.list_tax_reports_by_modelo_no(user_id, "130", year):
+            report_q = str(report.get("quarter") or "")
+            if report_q and report_q < str(quarter.value if hasattr(quarter, "value") else quarter):
+                prior += float((report.get("results") or {}).get("irpf_payable") or 0)
+        totals.prior_payments = round(max(0.0, prior), 2)
         gross_irpf                   = round(max(0.0, totals.taxable_income * totals.irpf_rate), 2)
         totals.irpf_payable          = round(max(0.0, gross_irpf - totals.irpf_already_withheld), 2)
 
@@ -361,6 +410,7 @@ class TaxEngineService:
 
         totals.total_rent_base     = round(totals.total_rent_base, 2)
         totals.withholding_payable = round(totals.withholding_payable, 2)
+        totals.percipient_count = 1 if totals.withholding_payable or totals.total_rent_base else 0
 
         report = TaxReport(
             user_id=user_id, organization_id=organization_id,
@@ -391,24 +441,35 @@ class TaxEngineService:
         """
         from app.models.tax_engine import Modelo111Results, Modelo111Response
         self._require_applicable_modelo(user_id, "111")
-        start, end = _quarter_date_range(year, quarter)
-        raw     = self._get_entries_for_modelo(user_id, organization_id, modelo_id, start, end)
-        entries = self._filter_by_invoice_date(raw, start, end)
-
+        qval = quarter.value if hasattr(quarter, "value") else str(quarter)
+        lines = self._percipient_lines(user_id, year, qval)
         totals = Modelo111Results()
-        count  = 0
+        count = 0
 
-        for entry in entries:
-            a = _extract_amounts(entry)
-            if a["total_with_tax"] == 0:
-                continue
-            count += 1
-            totals.total_base    += a["base_amount"]
-            totals.total_withheld += a["irpf_retention"]
+        if lines:
+            totals.lines = lines
+            totals.percipient_count = len(lines)
+            totals.legally_complete = True
+            for line in lines:
+                totals.total_base += float(line["base_amount"] or 0)
+                totals.total_withheld += float(line["withheld_amount"] or 0)
+            count = len(lines)
+        else:
+            start, end = _quarter_date_range(year, quarter)
+            raw     = self._get_entries_for_modelo(user_id, organization_id, modelo_id, start, end)
+            entries = self._filter_by_invoice_date(raw, start, end)
+            for entry in entries:
+                a = _extract_amounts(entry)
+                if a["total_with_tax"] == 0:
+                    continue
+                count += 1
+                totals.total_base    += a["base_amount"]
+                totals.total_withheld += a["irpf_retention"]
+            totals.legally_complete = False
 
         totals.total_base         = round(totals.total_base, 2)
         totals.total_withheld     = round(totals.total_withheld, 2)
-        totals.withholding_payable = totals.total_withheld  # already deducted at source
+        totals.withholding_payable = totals.total_withheld
 
         report = TaxReport(
             user_id=user_id, organization_id=organization_id,
@@ -445,6 +506,7 @@ class TaxEngineService:
         entries = self._filter_by_invoice_date(raw, start, end)
 
         totals = Modelo390Results()
+        vat_by_rate = _empty_vat_by_rate()
         count  = 0
 
         for entry in entries:
@@ -452,18 +514,27 @@ class TaxEngineService:
             if a["total_with_tax"] == 0:
                 continue
             count += 1
+            bucket = vat_by_rate[_bucket_vat_rate(a["vat_rate"])]
             if _is_income(a["transaction_type"]):
                 totals.total_sales += a["base_amount"]
                 totals.output_vat  += a["vat_amount"]
+                bucket["output_base"] += a["base_amount"]
+                bucket["output_vat"]  += a["vat_amount"]
             else:
                 totals.total_expenses += a["base_amount"]
                 totals.input_vat      += a["vat_amount"]
+                bucket["input_base"] += a["base_amount"]
+                bucket["input_vat"]  += a["vat_amount"]
 
         totals.total_sales    = round(totals.total_sales, 2)
         totals.total_expenses = round(totals.total_expenses, 2)
         totals.output_vat     = round(totals.output_vat, 2)
         totals.input_vat      = round(totals.input_vat, 2)
         totals.net_vat        = round(totals.output_vat - totals.input_vat, 2)
+        totals.vat_by_rate = {
+            rate: {field: round(value, 2) for field, value in bucket.items()}
+            for rate, bucket in vat_by_rate.items()
+        }
 
         # Sum quarterly 303 payments already filed
         quarterly_reports = self.repo.list_tax_reports_by_modelo_no(user_id, "303", year)
@@ -496,45 +567,20 @@ class TaxEngineService:
         year: int, modelo_id: str
     ):
         """
-        Annual IRPF summary — aggregates all 4 quarters.
-        balance_payable = annual_irpf - quarterly_130_payments - total_withheld
+        Annual withholding summary of percipient lines (Modelo 190).
+        Not an annual IRPF income return.
         """
         from app.models.tax_engine import Modelo190Results, Modelo190Response, Quarter
         self._require_applicable_modelo(user_id, "190")
-        start = datetime(year, 1, 1)
-        end   = datetime(year, 12, 31, 23, 59, 59)
-        raw     = self._get_entries_for_modelo(user_id, organization_id, modelo_id, start, end)
-        entries = self._filter_by_invoice_date(raw, start, end)
-
-        totals = Modelo190Results()
-        count  = 0
-
-        for entry in entries:
-            a = _extract_amounts(entry)
-            if a["total_with_tax"] == 0:
-                continue
-            count += 1
-            if _is_income(a["transaction_type"]):
-                totals.total_income   += a["base_amount"]
-                totals.total_withheld += a["irpf_retention"]
-            else:
-                totals.total_expenses += a["base_amount"]
-
-        totals.total_income   = round(totals.total_income, 2)
-        totals.total_expenses = round(totals.total_expenses, 2)
-        totals.taxable_income = round(totals.total_income - totals.total_expenses, 2)
+        lines = self._percipient_lines(user_id, year, None)
+        totals = Modelo190Results(lines=lines, percipient_count=len(lines))
+        for line in lines:
+            totals.total_base += float(line["base_amount"] or 0)
+            totals.total_withheld += float(line["withheld_amount"] or 0)
+        totals.total_base = round(totals.total_base, 2)
         totals.total_withheld = round(totals.total_withheld, 2)
-        totals.annual_irpf    = round(max(0.0, totals.taxable_income * totals.irpf_rate), 2)
-
-        # Sum quarterly 130 payments already filed
-        quarterly_reports = self.repo.list_tax_reports_by_modelo_no(user_id, "130", year)
-        totals.quarterly_payments = round(
-            sum(r.get("results", {}).get("irpf_payable", 0) for r in quarterly_reports), 2
-        )
-
-        totals.balance_payable = round(
-            max(0.0, totals.annual_irpf - totals.quarterly_payments - totals.total_withheld), 2
-        )
+        totals.legally_complete = bool(lines)
+        count = len(lines)
 
         report = TaxReport(
             user_id=user_id, organization_id=organization_id,

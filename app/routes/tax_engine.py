@@ -13,7 +13,7 @@ POST /tax-engine/backfill              → Classify all unclassified entries for
 
 from fastapi import APIRouter, HTTPException, Depends, Query
 from typing import Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.models.tax_engine import (
     TaxCalculationRequest, Modelo303Response, Modelo130Response,
@@ -24,8 +24,13 @@ from app.models.tax_engine import (
 from app.services.tax_engine_service import TaxEngineService
 from app.services.tax_classification_service import TaxClassificationService
 from app.routes.auth import get_current_user
+from app.routes.spain_tax_dep import require_spanish_tax
 
-router = APIRouter(prefix="/tax-engine", tags=["Tax Engine"])
+router = APIRouter(
+    prefix="/tax-engine",
+    tags=["Tax Engine"],
+    dependencies=[Depends(require_spanish_tax)],
+)
 
 _engine     = TaxEngineService()
 _classifier = TaxClassificationService()
@@ -35,8 +40,10 @@ _classifier = TaxClassificationService()
 
 class TaxCalcRequest(BaseModel):
     year: int
-    quarter: str                    # "Q1" | "Q2" | "Q3" | "Q4"
-    modelo_id: Optional[str] = None # MongoDB _id — if omitted, all classified entries are used
+    quarter: Optional[str] = None       # "Q1" | "Q2" | "Q3" | "Q4"
+    month: Optional[int] = Field(None, ge=1, le=12)  # monthly 303 (REDEME)
+    period_key: Optional[str] = None    # e.g. 2026-03
+    modelo_id: Optional[str] = None     # MongoDB _id — if omitted, all classified entries are used
 
 
 class AnnualCalcRequest(BaseModel):
@@ -52,15 +59,16 @@ async def calculate_modelo_303(
     current_user: dict = Depends(get_current_user),
 ):
     """
-    Calculate Modelo 303 (IVA) for the given year, quarter, and modelo_id.
+    Calculate Modelo 303 (IVA) for the given year and period.
+    Quarterly filers pass quarter (Q1-Q4). Monthly REDEME filers pass month 1-12.
     Only processes entries pre-classified as belonging to this modelo_id.
     """
-    from app.models.tax_engine import Quarter
     user_id = str(current_user["_id"])
     org_id  = str(current_user.get("organization_id", user_id))
     try:
         return _engine.calculate_modelo_303(
-            user_id, org_id, body.year, Quarter(body.quarter), body.modelo_id
+            user_id, org_id, body.year, body.quarter, body.modelo_id,
+            month=body.month, period_key=body.period_key,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

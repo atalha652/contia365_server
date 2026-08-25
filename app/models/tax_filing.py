@@ -21,7 +21,14 @@ class TaxFilingCreate(BaseModel):
     modelo: str = Field(..., examples=["303"])
     year: int
     quarter: Optional[str] = Field(
-        None, description="Q1-Q4 for quarterly modelos; omit for annual modelos"
+        None, description="Q1-Q4 for quarterly modelos; omit for annual or monthly 303"
+    )
+    month: Optional[int] = Field(
+        None, ge=1, le=12,
+        description="1-12 when the fiscal profile files 303 monthly (REDEME)",
+    )
+    period_key: Optional[str] = Field(
+        None, description="Calendar key e.g. 2026-03 for monthly 303"
     )
 
 
@@ -40,7 +47,11 @@ class TaxFilingSubmitRequest(BaseModel):
     comment: Optional[str] = None
     test_mode: bool = Field(
         True,
-        description="Must be true until an AEAT tax-modelo service is configured",
+        description="True = fake TEST- reference. False = live AEAT via T5+T6.",
+    )
+    cert_password: Optional[str] = Field(
+        None,
+        description="PKCS#12 password for live AEAT submit. Used in-memory only; never stored.",
     )
 
 

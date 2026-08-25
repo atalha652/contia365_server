@@ -16,6 +16,7 @@ from app.models.tax_engine import TaxReport, TaxReportStatus, Quarter
 from app.services.fiscal_profile_service import (
     applicable_modelos,
     get_canonical_fiscal_profile,
+    obligation_periodicity,
 )
 
 load_dotenv()
@@ -40,6 +41,12 @@ class TaxEngineRepository:
             self.users, self.census_data, user_id
         )
         return applicable_modelos(profile)
+
+    def get_modelo_periodicity(self, user_id: str, modelo: str) -> str:
+        profile = get_canonical_fiscal_profile(
+            self.users, self.census_data, user_id
+        )
+        return obligation_periodicity(profile, modelo)
 
     def _create_indexes(self):
         try:
@@ -109,17 +116,31 @@ class TaxEngineRepository:
         doc = report.model_dump(by_alias=False, exclude={"id"})
         doc["calculated_at"] = datetime.utcnow()
 
-        result = self.tax_reports.find_one_and_update(
-            {
-                "user_id": report.user_id,
-                "modelo": report.modelo,
-                "year": report.year,
-                "quarter": report.quarter,
-            },
-            {"$set": doc},
-            upsert=True,
-            return_document=True,
-        )
+        if not doc.get("period_key"):
+            doc["period_key"] = str(report.period_key or report.quarter or "")
+        base = {
+            "user_id": report.user_id,
+            "modelo": report.modelo,
+            "year": report.year,
+        }
+        existing = None
+        if doc.get("period_key"):
+            existing = self.tax_reports.find_one({**base, "period_key": doc["period_key"]})
+        if existing is None and report.quarter:
+            existing = self.tax_reports.find_one({**base, "quarter": report.quarter})
+        if existing:
+            result = self.tax_reports.find_one_and_update(
+                {"_id": existing["_id"]},
+                {"$set": doc},
+                return_document=True,
+            )
+        else:
+            result = self.tax_reports.find_one_and_update(
+                {**base, "quarter": report.quarter},
+                {"$set": doc},
+                upsert=True,
+                return_document=True,
+            )
         return str(result["_id"])
 
     def get_tax_report(

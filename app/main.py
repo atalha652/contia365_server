@@ -3,7 +3,8 @@ from contextlib import asynccontextmanager
 from app.routes import (
     api, auth, project, report, accounting, voucher, ledger, ocr,
     gmail_api, ledgers, outlook_api, dashboard, bank_transactions, billing, modelo, onboarding,
-    census_data, tax_dashboard, tax_engine, tax_filings, tax_calculation, invoices, chatbot
+    census_data, tax_dashboard, tax_engine, tax_filings, tax_calculation, invoices, chatbot, waitlist,
+    tax_percipients,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from pymongo import MongoClient
@@ -88,11 +89,17 @@ app.include_router(tax_engine.router, prefix="/api")
 # Tax filing workflow routes
 app.include_router(tax_filings.router, prefix="/api")
 
+# Percipient (employee) records for 111 / 190
+app.include_router(tax_percipients.router, prefix="/api")
+
 # Invoice routes
 app.include_router(invoices.router, prefix="/api")
 
 # Contia Copilot — AI chatbot
 app.include_router(chatbot.router, prefix="/api")
+
+# Product waitlist (White Label, Italy)
+app.include_router(waitlist.router, prefix="/api")
 
 
 @app.get("/")

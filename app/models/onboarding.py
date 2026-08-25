@@ -6,8 +6,10 @@ Handles user type selection and onboarding flow
 from datetime import datetime
 from enum import Enum
 from typing import Optional, Dict, Any
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from bson import ObjectId
+
+from app.services.user_type_vocab import canonicalize_user_type
 
 
 class PyObjectId(str):
@@ -26,9 +28,16 @@ class PyObjectId(str):
 
 class UserTypeSelection(str, Enum):
     """Stored user types. Advisor is legacy: not offered to new users."""
-    FREELANCER = "freelancer"  # Autónomo
-    COMPANY = "company"        # Business entity
-    ADVISOR = "advisor"        # Legacy Asesor accounts only (not White Label)
+    PERSON = "person"
+    BUSINESS = "business"
+    ADVISOR = "advisor"
+
+    @classmethod
+    def _missing_(cls, value):
+        mapped = canonicalize_user_type(value)
+        if mapped is None:
+            return None
+        return cls(mapped)
 
 
 class CountrySelection(str, Enum):
@@ -54,20 +63,20 @@ class UserTypeInfo(BaseModel):
 
 
 # Shown in GET /user-types. Advisor is kept on the enum for existing accounts.
-SELECTABLE_USER_TYPES = (UserTypeSelection.FREELANCER, UserTypeSelection.COMPANY)
+SELECTABLE_USER_TYPES = (UserTypeSelection.PERSON, UserTypeSelection.BUSINESS)
 
 USER_TYPE_CATALOG = {
-    UserTypeSelection.FREELANCER: UserTypeInfo(
-        id="freelancer",
-        name="Freelancer",
+    UserTypeSelection.PERSON: UserTypeInfo(
+        id="person",
+        name="Person",
         subtitle="Autónomo",
-        description="Individual freelancer or self-employed professional managing their own invoices and taxes.",
+        description="Individual professional managing their own invoices and taxes.",
     ),
-    UserTypeSelection.COMPANY: UserTypeInfo(
-        id="company",
-        name="Company",
+    UserTypeSelection.BUSINESS: UserTypeInfo(
+        id="business",
+        name="Business",
         subtitle="Empresa",
-        description="Business entity with employees and complex accounting and invoicing needs.",
+        description="Company with employees, accounting, and invoicing needs.",
     ),
     UserTypeSelection.ADVISOR: UserTypeInfo(
         id="advisor",
@@ -85,12 +94,24 @@ class CountryInfo(BaseModel):
     subtitle: str
     currency: str
     tax_authority: str
+    tax_available: bool = True
+    status: str = "Available"
 
 
 class OnboardingRequest(BaseModel):
     """Request model for user type selection"""
     user_type: UserTypeSelection
     additional_info: Optional[Dict[str, Any]] = {}
+
+    @field_validator("user_type", mode="before")
+    @classmethod
+    def coerce_legacy_user_type(cls, value):
+        if isinstance(value, UserTypeSelection):
+            return value
+        mapped = canonicalize_user_type(value)
+        if mapped is None:
+            raise ValueError("Invalid user type. Choose person or business.")
+        return mapped
 
 
 class CountrySelectRequest(BaseModel):
@@ -130,22 +151,22 @@ class OnboardingStatus(BaseModel):
 
 # Configuration for each user type
 USER_TYPE_CONFIGS = {
-    UserTypeSelection.FREELANCER: {
-        "dashboard_layout": "freelancer",
+    UserTypeSelection.PERSON: {
+        "dashboard_layout": "person",
         "default_features": ["invoicing", "expenses", "tax_reports"],
-        "chart_of_accounts": "freelancer_coa",
+        "chart_of_accounts": "person_coa",
         "tax_regime": "autonomo"
     },
-    UserTypeSelection.COMPANY: {
-        "dashboard_layout": "company", 
+    UserTypeSelection.BUSINESS: {
+        "dashboard_layout": "business",
         "default_features": ["invoicing", "expenses", "payroll", "tax_reports", "bank_reconciliation"],
-        "chart_of_accounts": "company_coa",
-        "tax_regime": "company"
+        "chart_of_accounts": "business_coa",
+        "tax_regime": "business"
     },
     UserTypeSelection.ADVISOR: {
         "dashboard_layout": "advisor",
         "default_features": ["client_management", "multi_company", "tax_reports", "advisory_tools"],
-        "chart_of_accounts": "advisor_coa", 
+        "chart_of_accounts": "advisor_coa",
         "tax_regime": "advisor"
     }
 }
@@ -158,6 +179,8 @@ COUNTRY_CONFIGS = {
         "currency": "EUR",
         "tax_authority": "AEAT",
         "invoice_format": "facturae",
+        "tax_available": True,
+        "status": "Available",
     },
     CountrySelection.ITALY: {
         "id": "IT",
@@ -166,5 +189,7 @@ COUNTRY_CONFIGS = {
         "currency": "EUR",
         "tax_authority": "AdE",
         "invoice_format": "fattura_pa",
+        "tax_available": False,
+        "status": "Coming soon",
     },
 }

@@ -16,6 +16,7 @@ from app.models.tax_models import (
     TaxPeriodRequest, AutoMapRequest
 )
 from app.routes.auth import get_current_user
+from app.routes.spain_tax_dep import require_spanish_tax
 
 # Database connection
 from pymongo import MongoClient
@@ -30,7 +31,11 @@ DB_NAME = os.getenv("DB_NAME")
 client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
 db = client[DB_NAME]
 
-router = APIRouter(prefix="/tax", tags=["Tax Calculations"])
+router = APIRouter(
+    prefix="/tax",
+    tags=["Tax Calculations"],
+    dependencies=[Depends(require_spanish_tax)],
+)
 logger = logging.getLogger(__name__)
 
 

@@ -30,6 +30,7 @@ ALGORITHM = os.getenv("ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "600"))
 
 from app.services.onboarding_status import persist_computed_onboarding
+from app.services.user_type_vocab import ADVISOR, BUSINESS, PERSON, canonicalize_user_type, stored_account_kind
 
 # -------------------- Database Connection --------------------
 client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
@@ -47,8 +48,10 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 class UserType(str, Enum):
     individual = "individual"
     organization = "organization"
-    freelancer = "freelancer"
-    company = "company"
+    person = "person"
+    business = "business"
+    freelancer = "freelancer"  # legacy alias of person
+    company = "company"        # legacy alias of business
     advisor = "advisor"
 
 # -------------------- Pydantic Models --------------------
@@ -103,7 +106,7 @@ class UserCreate(BaseModel):
     
     # ONBOARDING FIELDS (added for onboarding flow)
     onboarding_completed: Optional[bool] = False
-    user_type_selection: Optional[str] = None  # "freelancer", "company", "advisor"
+    user_type_selection: Optional[str] = None  # "person", "business", "advisor"
     onboarding_step: Optional[int] = 0
     
     # EXISTING OPTIONAL FIELDS (kept for backward compatibility)
@@ -361,7 +364,8 @@ def login(user: UserLogin):
         "tax_id": db_user["tax_id"],
         "organization_info": db_user.get("organization_info", {}),
         "onboarding_completed": status["onboarding_completed"],
-        "user_type": db_user.get("user_type_selection", None),
+        "user_type": canonicalize_user_type(db_user.get("user_type_selection"))
+        or db_user.get("user_type_selection"),
         "country": db_user.get("country", None),
         "fiscal_profile_completed": status["fiscal_profile_completed"],
         "census_data_uploaded": status["census_data_uploaded"],
@@ -394,32 +398,33 @@ def update_user_type(
     data: OnboardingUpdate,
     current_user: dict = Depends(get_current_user)
 ):
-    selectable = {UserType.freelancer, UserType.company}
+    canon = canonicalize_user_type(data.user_type.value)
     existing = current_user.get("user_type_selection") or current_user.get("type")
-    already_advisor = existing == UserType.advisor.value
+    already_advisor = canonicalize_user_type(existing) == ADVISOR
 
-    if data.user_type not in selectable:
-        if not (data.user_type == UserType.advisor and already_advisor):
+    if canon not in {PERSON, BUSINESS}:
+        if not (canon == ADVISOR and already_advisor):
             raise HTTPException(
                 status_code=400,
-                detail="Invalid onboarding type. Choose freelancer or company.",
+                detail="Invalid onboarding type. Choose person or business.",
             )
 
+    stored_kind = stored_account_kind(canon) or "individual"
     users_collection.update_one(
         {"_id": current_user["_id"]},
         {"$set": {
-            "type": data.user_type,
-            "user_type_selection": data.user_type.value,
+            "type": stored_kind,
+            "user_type_selection": canon,
         }}
     )
     status = persist_computed_onboarding(
         users_collection,
         census_collection,
-        {**current_user, "user_type_selection": data.user_type.value, "type": data.user_type},
+        {**current_user, "user_type_selection": canon, "type": stored_kind},
     )
     return {
         "message": "User type updated successfully",
-        "user_type": data.user_type,
+        "user_type": canon,
         "onboarding_completed": status["onboarding_completed"],
         "current_step": status["current_step"],
         "fiscal_profile_completed": status["fiscal_profile_completed"],

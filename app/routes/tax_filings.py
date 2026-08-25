@@ -3,6 +3,7 @@
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import Response
 
 from app.models.tax_filing import (
     TaxFilingActionRequest,
@@ -12,10 +13,22 @@ from app.models.tax_filing import (
     TaxFilingSubmitRequest,
 )
 from app.routes.auth import get_current_user
-from app.services.tax_filing_service import TaxFilingService, serialize_filing
+from app.routes.spain_tax_dep import require_spanish_tax
+from app.services.aeat_modelo_client import AeatModeloClientError
+from app.services.spain_tax_access import ItalyTaxUnavailableError
+from app.services.tax_filing_service import (
+    FilingConflictError,
+    FilingForbiddenError,
+    TaxFilingService,
+    serialize_filing,
+)
 
 
-router = APIRouter(prefix="/tax-filings", tags=["Tax Filings"])
+router = APIRouter(
+    prefix="/tax-filings",
+    tags=["Tax Filings"],
+    dependencies=[Depends(require_spanish_tax)],
+)
 service = TaxFilingService()
 
 
@@ -25,8 +38,24 @@ def _run(action):
         if isinstance(result, list):
             return [serialize_filing(item) for item in result]
         return serialize_filing(result)
+    except ItalyTaxUnavailableError as exc:
+        raise HTTPException(status_code=403, detail=exc.detail)
     except LookupError as exc:
         raise HTTPException(status_code=404, detail=str(exc))
+    except FilingForbiddenError as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
+    except FilingConflictError as exc:
+        raise HTTPException(status_code=409, detail=exc.as_detail())
+    except AeatModeloClientError as exc:
+        status = 400 if exc.code in {"CERT", "CONFIG"} else 502
+        raise HTTPException(
+            status_code=status,
+            detail={
+                "error": "AEAT_MODELO",
+                "code": exc.code,
+                "description": exc.description,
+            },
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
 
@@ -39,7 +68,8 @@ async def create_tax_filing(
     """Create one DRAFT filing for an applicable modelo and fiscal period."""
     return _run(
         lambda: service.create(
-            current_user, body.modelo, body.year, body.quarter
+            current_user, body.modelo, body.year, body.quarter,
+            month=body.month, period_key=body.period_key,
         )
     )
 
@@ -109,15 +139,40 @@ async def submit_tax_filing(
     current_user: dict = Depends(get_current_user),
 ):
     """
-    APPROVED -> SUBMITTED.
+    APPROVED -> SUBMITTED (test_mode) or ACCEPTED/REJECTED (live 303).
 
-    This is deliberately test-only until a tax-modelo AEAT endpoint is configured.
-    It never sends Modelo data to the existing VeriFactu invoice endpoint.
+    Live submit builds the official modelo file (T5) and posts it via
+    aeat_modelo_client (T6). It never uses the VeriFactu invoice endpoint.
+    cert_password is used in-memory only and is never stored.
+    111 and 190 require percipient records.
     """
     return _run(
-        lambda: service.submit_test(
-            filing_id, current_user, body.comment, body.test_mode
+        lambda: service.submit(
+            filing_id,
+            current_user,
+            body.comment,
+            body.test_mode,
+            body.cert_password,
         )
+    )
+
+
+@router.get("/{filing_id}/justificante")
+def download_tax_filing_justificante(
+    filing_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """PDF receipt from stored AEAT fields (code, message, CSV, justificante)."""
+    try:
+        pdf_bytes, filename = service.justificante_pdf(filing_id, current_user)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 
@@ -127,7 +182,7 @@ async def record_tax_filing_result(
     body: TaxFilingResultRequest,
     current_user: dict = Depends(get_current_user),
 ):
-    """SUBMITTED -> ACCEPTED/REJECTED; simulates an AEAT test response."""
+    """SUBMITTED -> ACCEPTED/REJECTED for test-mode filings of modelos without live AEAT."""
     result = body.model_dump(exclude={"accepted", "comment"})
     return _run(
         lambda: service.record_result(

@@ -6,6 +6,8 @@ from typing import Dict, Iterable, List, Optional
 from bson import ObjectId
 from pymongo.collection import Collection
 
+from app.services.user_type_vocab import is_person_user_type
+
 
 def get_canonical_fiscal_profile(
     users: Collection,
@@ -51,10 +53,40 @@ def merge_profile_data(existing: dict, incoming: dict, incoming_wins: bool = Tru
     return result
 
 
+def obligation_periodicity(profile: Optional[dict], modelo: str) -> str:
+    """Return TRIMESTRAL / MENSUAL / ANUAL for a modelo on the canonical profile."""
+    for obligation in (profile or {}).get("periodic_tax_obligations") or []:
+        if str(obligation.get("modelo")) == str(modelo):
+            return str(obligation.get("periodicity") or "TRIMESTRAL").upper()
+    return "TRIMESTRAL"
+
+
+def is_redeme_303(profile: Optional[dict]) -> bool:
+    return obligation_periodicity(profile, "303") == "MENSUAL"
+
+
+def _is_monthly_303(item: Optional[dict]) -> bool:
+    return bool(
+        item
+        and str(item.get("modelo")) == "303"
+        and str(item.get("periodicity") or "").upper() == "MENSUAL"
+    )
+
+
+def _annotate_redeme(item: dict) -> dict:
+    """Mark monthly 303 as REDEME without overwriting the census description."""
+    if not _is_monthly_303(item):
+        item.pop("redeme", None)
+        return item
+    item["redeme"] = True
+    item["periodicity"] = "MENSUAL"
+    return item
+
+
 def derive_periodic_tax_obligations(
     profile: dict,
     existing: Optional[Iterable[dict]] = None,
-) -> List[Dict[str, str]]:
+) -> List[dict]:
     """Derive baseline Spanish modelos and retain explicit census obligations."""
     by_modelo = {
         str(item["modelo"]): dict(item)
@@ -77,19 +109,25 @@ def derive_periodic_tax_obligations(
             "periodicity": "TRIMESTRAL",
             "source": "derived",
         })
-        by_modelo.setdefault("390", {
-            "modelo": "390",
-            "description": "Resumen anual del IVA",
-            "periodicity": "ANUAL",
-            "source": "derived",
-        })
-    if irpf_method or (profile.get("user_type") == "freelancer" and has_iae):
+        # REDEME monthly 303 filers are generally exonerated from modelo 390.
+        if not _is_monthly_303(by_modelo.get("303")):
+            by_modelo.setdefault("390", {
+                "modelo": "390",
+                "description": "Resumen anual del IVA",
+                "periodicity": "ANUAL",
+                "source": "derived",
+            })
+        elif str((by_modelo.get("390") or {}).get("source") or "") == "derived":
+            by_modelo.pop("390", None)
+    if irpf_method or (is_person_user_type(profile.get("user_type")) and has_iae):
         by_modelo.setdefault("130", {
             "modelo": "130",
             "description": "Pago fraccionado del IRPF",
             "periodicity": "TRIMESTRAL",
             "source": "derived",
         })
+    if "303" in by_modelo:
+        by_modelo["303"] = _annotate_redeme(by_modelo["303"])
     return list(by_modelo.values())
 
 

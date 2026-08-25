@@ -35,6 +35,7 @@ from app.services.fiscal_profile_service import (
     merge_profile_data,
     set_canonical_profile_id,
 )
+from app.services.user_type_vocab import canonicalize_user_type
 
 load_dotenv()
 
@@ -99,9 +100,9 @@ def _save_canonical_profile(current_user: dict, profile: dict) -> dict:
     now = datetime.utcnow()
     existing_id = profile.pop("_id", None)
     profile["country"] = current_user.get("country") or profile.get("country")
-    profile["user_type"] = (
+    profile["user_type"] = canonicalize_user_type(
         current_user.get("user_type_selection") or profile.get("user_type")
-    )
+    ) or profile.get("user_type")
     profile.update(canonical_profile_updates(profile))
     profile["user_id"] = str(current_user["_id"])
     profile["organization_id"] = str(

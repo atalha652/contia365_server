@@ -93,6 +93,9 @@ def _index_reports(reports: List[dict]) -> Dict[tuple, dict]:
         year = report.get("year")
         quarter = _report_quarter(report.get("quarter"))
         indexed[(modelo, year, quarter)] = report
+        period_key = str(report.get("period_key") or "")
+        if period_key:
+            indexed[(modelo, year, period_key)] = report
         # Annual modelos are stored as Q4 in tax_reports.
         indexed.setdefault((modelo, year, "ANNUAL"), report)
     return indexed
@@ -127,6 +130,7 @@ def _expand_periods(obligation: dict, year: int) -> List[dict]:
                 "periodicity": periodicity,
                 "year": year,
                 "quarter": None,
+                "month": month,
                 "period_key": f"{year}-{month:02d}",
                 "current_period": start.strftime("%B %Y"),
                 "period_start": start,
@@ -225,6 +229,8 @@ def build_fiscal_calendar(
             current_period=period["current_period"],
             year=period["year"],
             quarter=period["quarter"],
+            month=period.get("month"),
+            period_key=period.get("period_key"),
             period_start=period["period_start"].isoformat(),
             period_end=period["period_end"].isoformat(),
             deadline_date=period["deadline"].isoformat(),

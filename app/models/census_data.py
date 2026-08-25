@@ -48,7 +48,8 @@ class ProfessionalRegistration(BaseModel):
 class PeriodicTaxObligation(BaseModel):
     modelo: Optional[str] = None              # e.g. "303"
     description: Optional[str] = None
-    periodicity: Optional[str] = None         # e.g. "TRIMESTRAL"
+    periodicity: Optional[str] = None         # TRIMESTRAL / MENSUAL / ANUAL
+    redeme: Optional[bool] = None             # True when 303 is monthly (REDEME)
 
 
 # ===== Income & Expenses Summary =====

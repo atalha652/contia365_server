@@ -21,6 +21,7 @@ from app.models.onboarding import (
 )
 from app.routes.auth import get_current_user
 from app.services.onboarding_status import persist_computed_onboarding
+from app.services.user_type_vocab import ADVISOR, canonicalize_user_type
 
 # Load environment variables
 load_dotenv()
@@ -57,6 +58,8 @@ async def get_countries():
             subtitle=cfg["subtitle"],
             currency=cfg["currency"],
             tax_authority=cfg["tax_authority"],
+            tax_available=bool(cfg.get("tax_available", True)),
+            status=str(cfg.get("status") or "Available"),
         )
         for cfg in COUNTRY_CONFIGS.values()
     ]
@@ -115,18 +118,18 @@ async def select_user_type(
     try:
         user_id = current_user["_id"]
         selected_type = request.user_type
-        existing_type = current_user.get("user_type_selection")
+        existing_type = canonicalize_user_type(current_user.get("user_type_selection"))
 
         # New users can only pick types from GET /user-types.
         # Existing advisor accounts may keep (or re-save) advisor; do not map to white_label.
         if selected_type not in SELECTABLE_USER_TYPES:
             if not (
                 selected_type == UserTypeSelection.ADVISOR
-                and existing_type == UserTypeSelection.ADVISOR.value
+                and existing_type == ADVISOR
             ):
                 raise HTTPException(
                     status_code=400,
-                    detail="Invalid user type. Choose freelancer or company.",
+                    detail="Invalid user type. Choose person or business.",
                 )
 
         user_config = USER_TYPE_CONFIGS.get(selected_type, {})
@@ -137,10 +140,10 @@ async def select_user_type(
             "user_config": user_config,
         }
 
-        if selected_type == UserTypeSelection.COMPANY and current_user.get("organization_info"):
-            update_data["organization_info.type"] = "company"
+        if selected_type == UserTypeSelection.BUSINESS and current_user.get("organization_info"):
+            update_data["organization_info.type"] = "business"
             update_data["type"] = "organization"
-        elif selected_type == UserTypeSelection.FREELANCER:
+        elif selected_type == UserTypeSelection.PERSON:
             update_data["type"] = "individual"
         elif selected_type == UserTypeSelection.ADVISOR:
             update_data["type"] = "organization"
@@ -193,11 +196,11 @@ async def skip_onboarding(current_user: dict = Depends(get_current_user)):
     try:
         user_id = current_user["_id"]
         
-        # Set default configuration (freelancer)
-        default_config = USER_TYPE_CONFIGS[UserTypeSelection.FREELANCER]
+        # Set default configuration (person)
+        default_config = USER_TYPE_CONFIGS[UserTypeSelection.PERSON]
         
         update_data = {
-            "user_type_selection": UserTypeSelection.FREELANCER.value,
+            "user_type_selection": UserTypeSelection.PERSON.value,
             "updated_at": datetime.utcnow(),
             "user_config": default_config,
             "onboarding_skipped": True,
@@ -214,16 +217,16 @@ async def skip_onboarding(current_user: dict = Depends(get_current_user)):
         status = persist_computed_onboarding(
             users_collection,
             census_collection,
-            {**current_user, "user_type_selection": UserTypeSelection.FREELANCER.value},
+            {**current_user, "user_type_selection": UserTypeSelection.PERSON.value},
         )
 
         return {
             "message": "Onboarding skipped successfully",
-            "user_type": UserTypeSelection.FREELANCER.value,
+            "user_type": UserTypeSelection.PERSON.value,
             "onboarding_completed": status["onboarding_completed"],
             "current_step": status["current_step"],
             "fiscal_profile_completed": status["fiscal_profile_completed"],
-            "note": "Default freelancer configuration applied. Spain users still need the fiscal profile.",
+            "note": "Default person configuration applied. Spain users still need the fiscal profile.",
         }
         
     except Exception as e:
@@ -235,7 +238,10 @@ async def get_user_config(current_user: dict = Depends(get_current_user)):
     """
     Get user's current configuration based on their selected type
     """
-    user_type = current_user.get("user_type_selection")
+    user_type = (
+        canonicalize_user_type(current_user.get("user_type_selection"))
+        or current_user.get("user_type_selection")
+    )
     user_config = current_user.get("user_config", {})
     
     if not user_type:

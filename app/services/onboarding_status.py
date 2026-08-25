@@ -10,6 +10,8 @@ from typing import Any, Dict, Optional
 
 from pymongo.collection import Collection
 
+from app.services.user_type_vocab import canonicalize_user_type
+
 SPAIN = "ES"
 
 
@@ -54,7 +56,7 @@ def is_census_file_uploaded(census_collection: Collection, user_id: str) -> bool
 def compute_onboarding_status(user: dict, census_collection: Collection) -> Dict[str, Any]:
     user_id = str(user["_id"])
     country = user.get("country")
-    user_type = user.get("user_type_selection")
+    user_type = canonicalize_user_type(user.get("user_type_selection")) or user.get("user_type_selection")
     profile_id = user.get("fiscal_profile_id")
     latest = None
     if profile_id:
@@ -112,6 +114,9 @@ def persist_computed_onboarding(
         "fiscal_profile_completed": status["fiscal_profile_completed"],
         "updated_at": now,
     }
+    canon = status.get("user_type_selected")
+    if canon and canon != user.get("user_type_selection"):
+        update["user_type_selection"] = canon
     if status["onboarding_completed"] and not user.get("onboarding_completed_at"):
         update["onboarding_completed_at"] = now
         status["completed_at"] = now

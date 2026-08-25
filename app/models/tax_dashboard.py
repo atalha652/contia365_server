@@ -9,6 +9,10 @@ class TaxDeadlineItem(BaseModel):
     current_period: str = Field(..., description="e.g. 'Q1 2026' or 'March 2026'")
     year: Optional[int] = None
     quarter: Optional[str] = Field(None, description="Q1-Q4 for quarterly modelos")
+    month: Optional[int] = Field(None, description="1-12 for monthly 303 (REDEME)")
+    period_key: Optional[str] = Field(
+        None, description="Q2, ANNUAL, or 2026-03"
+    )
     period_start: Optional[str] = None
     period_end: Optional[str] = None
     deadline_date: str = Field(..., description="ISO date YYYY-MM-DD")

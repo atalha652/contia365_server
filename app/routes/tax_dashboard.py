@@ -15,6 +15,7 @@ from pymongo import MongoClient
 
 from app.models.tax_dashboard import TaxDeadlinesResponse
 from app.routes.auth import get_current_user
+from app.routes.spain_tax_dep import require_spanish_tax
 from app.services.fiscal_profile_service import get_canonical_fiscal_profile
 from app.services.tax_obligations_service import build_fiscal_calendar
 
@@ -27,7 +28,11 @@ client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
 db = client[DB_NAME]
 _tax_reports = db["tax_reports"]
 
-router = APIRouter(prefix="/tax-dashboard", tags=["Tax Dashboard"])
+router = APIRouter(
+    prefix="/tax-dashboard",
+    tags=["Tax Dashboard"],
+    dependencies=[Depends(require_spanish_tax)],
+)
 
 
 def _counts(items) -> dict:
