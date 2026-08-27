@@ -142,6 +142,7 @@ class OnboardingStatus(BaseModel):
     onboarding_completed: bool
     country_selected: Optional[str] = None
     user_type_selected: Optional[str] = None
+    role: Optional[str] = None
     fiscal_profile_completed: bool = False
     census_data_uploaded: bool = False
     current_step: str

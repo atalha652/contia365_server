@@ -144,6 +144,7 @@ async def submit_tax_filing(
     Live submit builds the official modelo file (T5) and posts it via
     aeat_modelo_client (T6). It never uses the VeriFactu invoice endpoint.
     cert_password is used in-memory only and is never stored.
+    If omitted, CERT_PASSWORD (or AEAT_P12_PASSWORD) from the server .env is used.
     111 and 190 require percipient records.
     """
     return _run(

@@ -3,7 +3,7 @@ Tax Models
 Models for tax calculations, VAT tracking, and IRPF computations
 """
 
-from pydantic import BaseModel, Field, ConfigDict
+from pydantic import BaseModel, Field, ConfigDict, model_validator
 from typing import Optional, List, Dict, Any
 from datetime import datetime, date
 from decimal import Decimal
@@ -94,11 +94,26 @@ class VATSummary(BaseModel):
     
     # Net VAT
     vat_payable: Decimal = Field(default=Decimal("0"), description="Output VAT - Input VAT")
+    # Tax engine names (T1 leftover on dashboard widgets)
+    output_vat: Decimal = Field(default=Decimal("0"), description="IVA repercutido")
+    input_vat: Decimal = Field(default=Decimal("0"), description="IVA soportado")
     
     # Breakdown by rate
     vat_by_rate: Dict[str, Dict[str, Decimal]] = Field(default_factory=dict)
     
     model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    @model_validator(mode="after")
+    def sync_engine_vat_names(self):
+        if not self.output_vat and self.output_vat_amount:
+            self.output_vat = self.output_vat_amount
+        elif not self.output_vat_amount and self.output_vat:
+            self.output_vat_amount = self.output_vat
+        if not self.input_vat and self.input_vat_amount:
+            self.input_vat = self.input_vat_amount
+        elif not self.input_vat_amount and self.input_vat:
+            self.input_vat_amount = self.input_vat
+        return self
 
 
 class IRPFSummary(BaseModel):
@@ -126,8 +141,33 @@ class IRPFSummary(BaseModel):
     
     # Final payment
     irpf_to_pay: Decimal = Field(default=Decimal("0"), description="IRPF for this quarter minus previous payments")
+    # Tax engine names (T1 leftover on dashboard widgets)
+    total_income: Decimal = Field(default=Decimal("0"))
+    total_expenses: Decimal = Field(default=Decimal("0"))
+    taxable_income: Decimal = Field(default=Decimal("0"))
+    prior_payments: Decimal = Field(default=Decimal("0"))
     
     model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    @model_validator(mode="after")
+    def sync_engine_irpf_names(self):
+        if not self.total_income and self.gross_income:
+            self.total_income = self.gross_income
+        elif not self.gross_income and self.total_income:
+            self.gross_income = self.total_income
+        if not self.total_expenses and self.deductible_expenses:
+            self.total_expenses = self.deductible_expenses
+        elif not self.deductible_expenses and self.total_expenses:
+            self.deductible_expenses = self.total_expenses
+        if not self.taxable_income and self.net_income:
+            self.taxable_income = self.net_income
+        elif not self.net_income and self.taxable_income:
+            self.net_income = self.taxable_income
+        if not self.prior_payments and self.previous_quarters_irpf:
+            self.prior_payments = self.previous_quarters_irpf
+        elif not self.previous_quarters_irpf and self.prior_payments:
+            self.previous_quarters_irpf = self.prior_payments
+        return self
 
 
 class ModeloMapping(BaseModel):

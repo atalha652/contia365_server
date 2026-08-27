@@ -1,5 +1,6 @@
 """Tax filing lifecycle and calculation orchestration."""
 
+import os
 from datetime import datetime
 from typing import Optional
 from uuid import uuid4
@@ -128,7 +129,30 @@ def serialize_filing(document: dict) -> dict:
     result["justificante_available"] = bool(
         (result.get("aeat_result") or {}).get("has_justificante")
     )
+    result["cert_password_from_env"] = bool(env_cert_password())
     return result
+
+
+def env_cert_password() -> str:
+    """Server .env password for the enrolled .p12. Never stored; in-memory only."""
+    for key in ("CERT_PASSWORD", "AEAT_P12_PASSWORD"):
+        value = (os.getenv(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def resolve_cert_password(provided: Optional[str]) -> str:
+    typed = (provided or "").strip()
+    if typed:
+        return typed
+    fallback = env_cert_password()
+    if fallback:
+        return fallback
+    raise ValueError(
+        "cert_password is required for live AEAT submission "
+        "(or set CERT_PASSWORD in the server .env for the enrolled certificate)."
+    )
 
 
 class TaxFilingService:
@@ -406,8 +430,7 @@ class TaxFilingService:
                 f"Live AEAT submission is not implemented for Modelo {modelo}. "
                 "Use test_mode=true."
             )
-        if not (cert_password or "").strip():
-            raise ValueError("cert_password is required for live AEAT submission.")
+        cert_password = resolve_cert_password(cert_password)
         if modelo not in ANNUAL_FILE_MODELOS and not (
             filing.get("quarter") or filing.get("month") or filing.get("period_key")
         ):

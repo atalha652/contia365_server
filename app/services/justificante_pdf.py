@@ -90,8 +90,8 @@ def build_justificante_pdf(filing: dict) -> bytes:
         Spacer(1, 12),
         Paragraph(
             escape(
-                "This is a Contia receipt from the stored AEAT response. "
-                "It is not an official AEAT PDF download."
+                "This is a Contia receipt built from stored AEAT fields (code, message, CSV, justificante). "
+                "It is not an official AEAT PDF. Accepted by AEAT is not paid."
             ),
             styles["ReceiptNote"],
         ),

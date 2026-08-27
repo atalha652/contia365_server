@@ -366,6 +366,9 @@ def login(user: UserLogin):
         "onboarding_completed": status["onboarding_completed"],
         "user_type": canonicalize_user_type(db_user.get("user_type_selection"))
         or db_user.get("user_type_selection"),
+        "user_type_selection": canonicalize_user_type(db_user.get("user_type_selection"))
+        or db_user.get("user_type_selection"),
+        "role": str(db_user.get("role") or "user").strip().lower() or "user",
         "country": db_user.get("country", None),
         "fiscal_profile_completed": status["fiscal_profile_completed"],
         "census_data_uploaded": status["census_data_uploaded"],
@@ -588,6 +591,10 @@ def google_callback(code: str, state: str):
             {"sub": user_id_str},
             timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
         )
+        session_user = users_collection.find_one({"_id": ObjectId(user_id_str)}) or {}
+        user_type = canonicalize_user_type(
+            session_user.get("user_type_selection")
+        ) or session_user.get("user_type_selection")
         return {
             "message": "Google login successful",
             "access_token": access_token,
@@ -595,6 +602,9 @@ def google_callback(code: str, state: str):
             "name": name,
             "email": email_lower,
             "user_id": user_id_str,
+            "role": str(session_user.get("role") or "user").strip().lower() or "user",
+            "user_type": user_type,
+            "user_type_selection": user_type,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Google OAuth callback error: {str(e)}")

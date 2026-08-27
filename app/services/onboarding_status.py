@@ -92,6 +92,7 @@ def compute_onboarding_status(user: dict, census_collection: Collection) -> Dict
         "onboarding_completed": completed,
         "country_selected": country,
         "user_type_selected": user_type,
+        "role": str(user.get("role") or "user").strip().lower() or "user",
         "fiscal_profile_completed": fiscal_flag,
         "census_data_uploaded": is_census_file_uploaded(census_collection, user_id),
         "current_step": step,

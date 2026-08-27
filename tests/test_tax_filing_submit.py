@@ -2,6 +2,7 @@
 
 import copy
 import json
+import os
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -230,10 +231,29 @@ class TaxFilingSubmitTests(unittest.TestCase):
 
     def test_live_requires_cert_password(self):
         svc, repo = _service(_approved_filing())
-        with self.assertRaises(ValueError) as ctx:
-            svc.submit("507f1f77bcf86cd799439011", _user(), None, False, "")
+        with patch.dict(
+            os.environ, {"CERT_PASSWORD": "", "AEAT_P12_PASSWORD": ""}, clear=False
+        ):
+            with self.assertRaises(ValueError) as ctx:
+                svc.submit("507f1f77bcf86cd799439011", _user(), None, False, "")
         self.assertIn("cert_password", str(ctx.exception))
         self.assertEqual(repo.filing["status"], TaxFilingStatus.APPROVED.value)
+
+    def test_live_uses_env_cert_password(self):
+        aeat = FakeAeat(_accept_response())
+        svc, _repo = _service(_approved_filing(), aeat=aeat)
+        with patch.dict(os.environ, {"CERT_PASSWORD": "env-secret"}, clear=False):
+            with patch(
+                "app.services.tax_filing_service.decrypt_p12", return_value=b"p12-bytes"
+            ):
+                updated = svc.submit(
+                    "507f1f77bcf86cd799439011", _user(), None, False, None
+                )
+        self.assertEqual(updated["status"], TaxFilingStatus.ACCEPTED.value)
+        self.assertEqual(aeat.calls[0]["p12_password"], "env-secret")
+        blob = json.dumps(updated, default=str)
+        self.assertNotIn("env-secret", blob)
+        self.assertNotIn("cert_password", blob)
 
     def test_live_130_accept_stores_aeat_fields(self):
         aeat = FakeAeat(_accept_response())

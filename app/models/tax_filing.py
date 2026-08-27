@@ -51,7 +51,10 @@ class TaxFilingSubmitRequest(BaseModel):
     )
     cert_password: Optional[str] = Field(
         None,
-        description="PKCS#12 password for live AEAT submit. Used in-memory only; never stored.",
+        description=(
+            "PKCS#12 password for live AEAT submit. Optional when CERT_PASSWORD "
+            "is set in the server .env (enrolled cert). Used in-memory only; never stored."
+        ),
     )
 
 
