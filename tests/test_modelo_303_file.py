@@ -120,6 +120,31 @@ class Modelo303FileTests(unittest.TestCase):
         self.assertTrue(blob.startswith("<T30302026030000>"))
         self.assertTrue(blob.endswith("</T30302026030000>"))
 
+    def test_xlsx_dp30301_positions_match_builder(self):
+        import openpyxl
+
+        wb = openpyxl.load_workbook(OFFICIAL_DISENO_PATH, data_only=True)
+        ws = wb["DP30301"]
+        fields = {}
+        last_end = 0
+        for row in ws.iter_rows(min_row=6, max_col=7, values_only=True):
+            pos, lon = row[1], row[2]
+            if not isinstance(pos, (int, float)) or not isinstance(lon, (int, float)):
+                continue
+            pos, lon = int(pos), int(lon)
+            fields[pos] = lon
+            last_end = max(last_end, pos + lon - 1)
+        self.assertEqual(last_end, PAGE1_LEN)
+        self.assertEqual(fields[14], 9)
+        self.assertEqual(fields[103], 4)
+        self.assertEqual(fields[107], 2)
+        self.assertEqual(fields[326], 17)
+        self.assertEqual(fields[343], 5)
+        self.assertEqual(fields[348], 17)
+        self.assertEqual(fields[696], 17)
+        self.assertEqual(fields[1019], 17)
+        self.assertEqual(fields[1570], 12)
+
     def test_december_redeme_is_last_period_and_exempt_from_390(self):
         page = build_page_01(
             nif="55238025Y",

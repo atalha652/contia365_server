@@ -31,6 +31,7 @@ ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "600"
 
 from app.services.onboarding_status import persist_computed_onboarding
 from app.services.user_type_vocab import ADVISOR, BUSINESS, PERSON, canonicalize_user_type, stored_account_kind
+from app.services.admin_users_service import ADMIN_PAGES, is_admin
 
 # -------------------- Database Connection --------------------
 client = MongoClient(MONGO_URI, tlsCAFile=certifi.where())
@@ -369,6 +370,7 @@ def login(user: UserLogin):
         "user_type_selection": canonicalize_user_type(db_user.get("user_type_selection"))
         or db_user.get("user_type_selection"),
         "role": str(db_user.get("role") or "user").strip().lower() or "user",
+        "admin_pages": ADMIN_PAGES if is_admin(db_user) else [],
         "country": db_user.get("country", None),
         "fiscal_profile_completed": status["fiscal_profile_completed"],
         "census_data_uploaded": status["census_data_uploaded"],
@@ -603,6 +605,7 @@ def google_callback(code: str, state: str):
             "email": email_lower,
             "user_id": user_id_str,
             "role": str(session_user.get("role") or "user").strip().lower() or "user",
+            "admin_pages": ADMIN_PAGES if is_admin(session_user) else [],
             "user_type": user_type,
             "user_type_selection": user_type,
         }

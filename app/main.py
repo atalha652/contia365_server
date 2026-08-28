@@ -4,7 +4,7 @@ from app.routes import (
     api, auth, project, report, accounting, voucher, ledger, ocr,
     gmail_api, ledgers, outlook_api, dashboard, bank_transactions, billing, modelo, onboarding,
     census_data, tax_dashboard, tax_engine, tax_filings, tax_calculation, invoices, chatbot, waitlist,
-    tax_percipients,
+    tax_percipients, admin_users,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from pymongo import MongoClient
@@ -100,6 +100,9 @@ app.include_router(chatbot.router, prefix="/api")
 
 # Product waitlist (White Label, Italy)
 app.include_router(waitlist.router, prefix="/api")
+
+# Admin user directory
+app.include_router(admin_users.router, prefix="/api")
 
 
 @app.get("/")
