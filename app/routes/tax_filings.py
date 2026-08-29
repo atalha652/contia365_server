@@ -139,12 +139,11 @@ async def submit_tax_filing(
     current_user: dict = Depends(get_current_user),
 ):
     """
-    APPROVED -> SUBMITTED (test_mode) or ACCEPTED/REJECTED (live 303).
+    APPROVED -> SUBMITTED (test_mode) or ACCEPTED/REJECTED (live).
 
     Live submit builds the official modelo file (T5) and posts it via
-    aeat_modelo_client (T6). It never uses the VeriFactu invoice endpoint.
-    cert_password is used in-memory only and is never stored.
-    If omitted, CERT_PASSWORD (or AEAT_P12_PASSWORD) from the server .env is used.
+    aeat_modelo_client using Contia365's own certificate as authorized representative.
+    It never uses the VeriFactu invoice endpoint.
     111 and 190 require percipient records.
     """
     return _run(
@@ -153,7 +152,6 @@ async def submit_tax_filing(
             current_user,
             body.comment,
             body.test_mode,
-            body.cert_password,
         )
     )
 

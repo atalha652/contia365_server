@@ -50,7 +50,13 @@ class OnboardingStep(str, Enum):
     """Onboarding process steps"""
     COUNTRY_SELECTION = "country_selection"
     USER_TYPE_SELECTION = "user_type_selection"
+    # Person (autónomo) path
     FISCAL_PROFILE = "fiscal_profile"
+    # Business (empresa) path
+    COMPANY_DETAILS = "company_details"
+    REPRESENTATIVE = "representative"
+    AEAT_CONNECTION = "aeat_connection"
+    # Both paths end here
     COMPLETED = "completed"
 
 
@@ -98,6 +104,94 @@ class CountryInfo(BaseModel):
     status: str = "Available"
 
 
+# ---------------------------------------------------------------------------
+# Business onboarding data models
+# ---------------------------------------------------------------------------
+
+class TaxAddress(BaseModel):
+    """Company tax address (domicilio fiscal)"""
+    address_line: Optional[str] = None
+    postal_code: Optional[str] = None
+    city: Optional[str] = None
+    province: Optional[str] = None
+
+
+class BusinessProfile(BaseModel):
+    """
+    Company details collected during business onboarding step 2.
+    The company (not the logged-in user) is the taxpayer.
+    CIF goes into the SOAP ObligadoTributario field on AEAT submissions.
+    """
+    legal_name: Optional[str] = None        # Razón social
+    cif: Optional[str] = None               # Company NIF e.g. B12345678
+    company_type: Optional[str] = None      # S.L., S.A., S.C.P., C.B., etc.
+    tax_address: Optional[TaxAddress] = None
+
+
+class AuthorizedRepresentative(BaseModel):
+    """
+    The person authorized to act for the company before AEAT.
+    Only one representative is needed — not every shareholder.
+    Role options: administrador / representante_legal / apoderado
+    """
+    full_name: Optional[str] = None
+    dni_nie: Optional[str] = None           # Representative's personal DNI/NIE
+    role: Optional[str] = None              # administrador / representante_legal / apoderado
+    connected_at: Optional[datetime] = None # When they authenticated to AEAT
+
+
+class AeatConnection(BaseModel):
+    """
+    Tracks whether AEAT connection has been established for this account.
+    Set once during onboarding. Not repeated unless requires_reauth = True.
+    For business: the representative authenticates and grants apoderamiento.
+    For person: the autónomo grants apoderamiento directly.
+    """
+    connected: bool = False
+    connected_at: Optional[datetime] = None
+    representative_nif: Optional[str] = None  # DNI/NIE of who completed the connection
+    requires_reauth: bool = False
+    last_sync_at: Optional[datetime] = None
+
+
+# ---------------------------------------------------------------------------
+# Request models for business onboarding endpoints
+# ---------------------------------------------------------------------------
+
+class BusinessProfileRequest(BaseModel):
+    """Body for POST /onboarding/business/company-details"""
+    legal_name: str = Field(..., description="Company legal name (razón social)")
+    cif: str = Field(..., description="Company NIF/CIF e.g. B12345678")
+    company_type: str = Field(..., description="S.L. / S.A. / S.C.P. / C.B. / etc.")
+    tax_address: Optional[TaxAddress] = None
+
+
+class RepresentativeRequest(BaseModel):
+    """Body for POST /onboarding/business/representative"""
+    full_name: str = Field(..., description="Full name of the authorized representative")
+    dni_nie: str = Field(..., description="DNI or NIE of the representative")
+    role: str = Field(
+        ...,
+        description="Role: administrador / representante_legal / apoderado"
+    )
+
+
+class AeatConnectRequest(BaseModel):
+    """
+    Body for POST /onboarding/business/aeat-connect.
+    The representative confirms they have authenticated on AEAT's portal
+    and granted apoderamiento to Contia365.
+    No certificate is stored — this only records the connection event.
+    """
+    representative_nif: str = Field(
+        ..., description="DNI/NIE of the representative who completed the AEAT connection"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Standard onboarding request/response models
+# ---------------------------------------------------------------------------
+
 class OnboardingRequest(BaseModel):
     """Request model for user type selection"""
     user_type: UserTypeSelection
@@ -137,18 +231,31 @@ class CountrySelectResponse(BaseModel):
 
 
 class OnboardingStatus(BaseModel):
-    """Single onboarding-status payload (login and GET /status must match)."""
+    """
+    Single onboarding-status payload.
+    login response and GET /status must return the same shape.
+    """
     user_id: str
     onboarding_completed: bool
     country_selected: Optional[str] = None
     user_type_selected: Optional[str] = None
     role: Optional[str] = None
+    # Person path flags
     fiscal_profile_completed: bool = False
     census_data_uploaded: bool = False
+    # Business path flags
+    business_profile_completed: bool = False
+    representative_completed: bool = False
+    aeat_connected: bool = False
+    # Common
     current_step: str
     completed_at: Optional[datetime] = None
     next_action: Optional[str] = None
 
+
+# ---------------------------------------------------------------------------
+# Configuration maps
+# ---------------------------------------------------------------------------
 
 # Configuration for each user type
 USER_TYPE_CONFIGS = {

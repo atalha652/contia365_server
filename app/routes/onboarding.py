@@ -18,6 +18,7 @@ from app.models.onboarding import (
     CountrySelection, CountryInfo, CountrySelectRequest,
     CountrySelectResponse, COUNTRY_CONFIGS,
     SELECTABLE_USER_TYPES, USER_TYPE_CATALOG,
+    BusinessProfileRequest, RepresentativeRequest, AeatConnectRequest,
 )
 from app.routes.auth import get_current_user
 from app.services.onboarding_status import persist_computed_onboarding
@@ -260,3 +261,280 @@ async def get_user_config(current_user: dict = Depends(get_current_user)):
         "fiscal_profile_completed": status["fiscal_profile_completed"],
         "census_data_uploaded": status["census_data_uploaded"],
     }
+
+
+# ===========================================================================
+# Business onboarding — Step 2: Company Details
+# ===========================================================================
+
+@router.post("/business/company-details")
+async def save_company_details(
+    request: BusinessProfileRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Business onboarding step 2.
+    Save company legal name, CIF, company type and tax address.
+    The company CIF becomes the ObligadoTributario in all AEAT submissions.
+    """
+    user_type = canonicalize_user_type(current_user.get("user_type_selection"))
+    if user_type != "business":
+        raise HTTPException(
+            status_code=400,
+            detail="Only business accounts can submit company details.",
+        )
+
+    cif = str(request.cif or "").replace(" ", "").upper()
+    if not cif:
+        raise HTTPException(status_code=400, detail="CIF is required.")
+
+    business_profile = {
+        "legal_name": request.legal_name.strip(),
+        "cif": cif,
+        "company_type": request.company_type.strip(),
+        "tax_address": request.tax_address.model_dump() if request.tax_address else None,
+        "updated_at": datetime.utcnow(),
+    }
+
+    result = users_collection.update_one(
+        {"_id": current_user["_id"]},
+        {"$set": {
+            "business_profile": business_profile,
+            "updated_at": datetime.utcnow(),
+        }}
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    status = persist_computed_onboarding(
+        users_collection,
+        census_collection,
+        {**current_user, "business_profile": business_profile},
+    )
+
+    return {
+        "message": "Company details saved successfully.",
+        "next_step": "representative",
+        "current_step": status["current_step"],
+        "onboarding_completed": status["onboarding_completed"],
+        "business_profile": business_profile,
+    }
+
+
+# ===========================================================================
+# Business onboarding — Step 3: Authorized Representative
+# ===========================================================================
+
+@router.post("/business/representative")
+async def save_representative(
+    request: RepresentativeRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Business onboarding step 3.
+    Save the authorized representative who will authenticate with AEAT.
+    Only one representative is needed — not every shareholder.
+    Role: administrador / representante_legal / apoderado
+    """
+    user_type = canonicalize_user_type(current_user.get("user_type_selection"))
+    if user_type != "business":
+        raise HTTPException(
+            status_code=400,
+            detail="Only business accounts can submit representative details.",
+        )
+
+    if not (current_user.get("business_profile") or {}).get("cif"):
+        raise HTTPException(
+            status_code=400,
+            detail="Complete company details before entering the representative.",
+        )
+
+    valid_roles = {"administrador", "representante_legal", "apoderado"}
+    role = str(request.role or "").strip().lower()
+    if role not in valid_roles:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid role. Choose from: {', '.join(valid_roles)}",
+        )
+
+    representative = {
+        "full_name": request.full_name.strip(),
+        "dni_nie": str(request.dni_nie or "").replace(" ", "").upper(),
+        "role": role,
+        "connected_at": None,
+        "updated_at": datetime.utcnow(),
+    }
+
+    result = users_collection.update_one(
+        {"_id": current_user["_id"]},
+        {"$set": {
+            "authorized_representative": representative,
+            "updated_at": datetime.utcnow(),
+        }}
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="User not found.")
+
+    status = persist_computed_onboarding(
+        users_collection,
+        census_collection,
+        {**current_user, "authorized_representative": representative},
+    )
+
+    return {
+        "message": "Authorized representative saved successfully.",
+        "next_step": "aeat_connection",
+        "current_step": status["current_step"],
+        "onboarding_completed": status["onboarding_completed"],
+        "representative": {
+            "full_name": representative["full_name"],
+            "dni_nie": representative["dni_nie"],
+            "role": representative["role"],
+        },
+    }
+
+
+# ===========================================================================
+# Business onboarding — Step 4: AEAT Connection
+# ===========================================================================
+
+@router.post("/business/aeat-connect")
+async def aeat_connect(
+    request: AeatConnectRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Business onboarding step 4.
+    The authorized representative confirms they have:
+      1. Authenticated on AEAT's portal using their digital certificate.
+      2. Granted Contia365 apoderamiento (representation) for the company.
+
+    No certificate is stored here — this only records that the connection
+    was completed. Contia365 will use its own company certificate for all
+    subsequent AEAT submissions on behalf of this company.
+
+    After this step, onboarding is complete. The user will not need to
+    repeat this unless AEAT requires re-authentication (requires_reauth=True).
+    """
+    user_type = canonicalize_user_type(current_user.get("user_type_selection"))
+    if user_type != "business":
+        raise HTTPException(
+            status_code=400,
+            detail="Only business accounts use this endpoint.",
+        )
+
+    if not (current_user.get("business_profile") or {}).get("cif"):
+        raise HTTPException(
+            status_code=400,
+            detail="Complete company details before connecting to AEAT.",
+        )
+
+    if not (current_user.get("authorized_representative") or {}).get("dni_nie"):
+        raise HTTPException(
+            status_code=400,
+            detail="Complete representative details before connecting to AEAT.",
+        )
+
+    now = datetime.utcnow()
+    rep_nif = str(request.representative_nif or "").replace(" ", "").upper()
+
+    aeat_connection = {
+        "connected": True,
+        "connected_at": now,
+        "representative_nif": rep_nif,
+        "requires_reauth": False,
+        "last_sync_at": now,
+    }
+
+    # Also stamp connected_at on the representative record
+    users_collection.update_one(
+        {"_id": current_user["_id"]},
+        {"$set": {
+            "aeat_connection": aeat_connection,
+            "authorized_representative.connected_at": now,
+            "updated_at": now,
+        }}
+    )
+
+    status = persist_computed_onboarding(
+        users_collection,
+        census_collection,
+        {**current_user, "aeat_connection": aeat_connection},
+    )
+
+    return {
+        "message": "AEAT connection established. Onboarding is complete.",
+        "aeat_connected": True,
+        "connected_at": now.isoformat(),
+        "current_step": status["current_step"],
+        "onboarding_completed": status["onboarding_completed"],
+    }
+
+
+# ===========================================================================
+# Post-onboarding: AEAT Sync
+# ===========================================================================
+
+@router.post("/aeat-sync")
+async def aeat_sync(current_user: dict = Depends(get_current_user)):
+    """
+    Post-onboarding AEAT sync.
+    Updates last_sync_at timestamp without repeating the full onboarding flow.
+    Use case: user clicks "Sync with AEAT" from the dashboard.
+    Also clears requires_reauth if it was set.
+    """
+    conn = current_user.get("aeat_connection") or {}
+    if not conn.get("connected"):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "AEAT connection has not been established. "
+                "Complete the onboarding aeat_connection step first."
+            ),
+        )
+
+    now = datetime.utcnow()
+    users_collection.update_one(
+        {"_id": current_user["_id"]},
+        {"$set": {
+            "aeat_connection.last_sync_at": now,
+            "aeat_connection.requires_reauth": False,
+            "updated_at": now,
+        }}
+    )
+
+    return {
+        "message": "AEAT sync completed.",
+        "last_sync_at": now.isoformat(),
+        "aeat_connected": True,
+    }
+
+
+# ===========================================================================
+# Admin utility: flag a user for AEAT re-authentication
+# ===========================================================================
+
+@router.post("/aeat-require-reauth")
+async def require_reauth(
+    user_id: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Admin endpoint — mark a user's AEAT connection as requiring re-authentication.
+    Called when AEAT returns an authorization error during submission.
+    """
+    from app.services.admin_users_service import is_admin
+    if not is_admin(current_user):
+        raise HTTPException(status_code=403, detail="Admin access required.")
+
+    users_collection.update_one(
+        {"_id": ObjectId(user_id)},
+        {"$set": {
+            "aeat_connection.requires_reauth": True,
+            "aeat_connection.connected": False,
+            "updated_at": datetime.utcnow(),
+        }}
+    )
+    return {"message": f"User {user_id} flagged for AEAT re-authentication."}

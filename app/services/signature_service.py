@@ -271,29 +271,21 @@ class SignatureService:
         return signed.encode("utf-8")
 
 
-# ---------------------------------------------------------------------------
-# Certificate storage helpers (encrypt/decrypt .p12 bytes for MongoDB)
-# ---------------------------------------------------------------------------
 
-def encrypt_p12(p12_bytes: bytes) -> bytes:
-    """
-    Encrypt raw .p12 bytes using Fernet symmetric encryption.
-    Key must be set in env var CERT_ENCRYPTION_KEY (base64-encoded 32-byte key).
-    Falls back to plain base64 if key is not configured (dev only).
-    """
-    key = os.getenv("CERT_ENCRYPTION_KEY")
-    if key:
-        from cryptography.fernet import Fernet
-        f = Fernet(key.encode())
-        return f.encrypt(p12_bytes)
-    # Dev fallback — no encryption
-    return base64.b64encode(p12_bytes)
 
+
+# ---------------------------------------------------------------------------
+# Certificate decryption helper (used by VeriFactu invoice submission only)
+# encrypt_p12 was removed — user cert upload is no longer supported.
+# decrypt_p12 is kept for existing stored certificates during migration.
+# ---------------------------------------------------------------------------
 
 def decrypt_p12(stored_bytes: bytes) -> bytes:
     """
     Decrypt .p12 bytes retrieved from MongoDB.
+    Used by the VeriFactu invoice submission flow in invoices.py.
     """
+    import base64
     key = os.getenv("CERT_ENCRYPTION_KEY")
     if key:
         from cryptography.fernet import Fernet

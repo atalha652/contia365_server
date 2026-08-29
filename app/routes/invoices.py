@@ -21,7 +21,7 @@ import logging
 from app.models.invoice import Invoice, InvoiceUpdate, InvoiceIssueResponse, InvoiceStatus
 from app.services.invoice_service import InvoiceService
 from app.services.facturae_service import FacturaeService, SellerInfo, VeriFactuService
-from app.services.signature_service import SignatureService, encrypt_p12, decrypt_p12
+from app.services.signature_service import SignatureService, decrypt_p12
 from app.services.aeat_client import AeatClient, AeatSubmissionError
 from app.routes.auth import get_current_user, users_collection, census_collection
 from app.services.fiscal_profile_service import get_canonical_fiscal_profile

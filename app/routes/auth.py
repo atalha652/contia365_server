@@ -292,17 +292,29 @@ async def signup(
     new_user = user.dict()
     new_user.update({
         "password_hash": hashed_pw,
-        "certificate_path": None,  # Will be set if certificate is uploaded
+        "certificate_path": None,
         "created_at": datetime.utcnow(),
         "updated_at": datetime.utcnow(),
         "gmail_credentials": user.gmail_credentials.dict() if user.gmail_credentials else None,
-        
+
         # ONBOARDING FIELDS
         "onboarding_completed": False,
         "user_type_selection": None,
         "onboarding_step": 0,
         "onboarding_completed_at": None,
         "country": None,
+
+        # BUSINESS ONBOARDING FIELDS — initialised as null for all users
+        # Populated during business onboarding steps 2/3/4
+        "business_profile": None,
+        "authorized_representative": None,
+        "aeat_connection": {
+            "connected": False,
+            "connected_at": None,
+            "representative_nif": None,
+            "requires_reauth": False,
+            "last_sync_at": None,
+        },
     })
 
     # Handle company name in organization_info if provided
@@ -615,62 +627,4 @@ def google_callback(code: str, state: str):
 
 
 
-# -------------------- Certificate Upload --------------------
 
-@router.post(
-    "/certificate",
-    summary="Upload user's .p12 digital certificate for AEAT VeriFactu signing",
-)
-async def upload_certificate(
-    certificate: UploadFile = File(..., description=".p12 / PKCS#12 certificate file"),
-    cert_password: str = Form(..., description="Password for the .p12 certificate"),
-    current_user: dict = Depends(get_current_user),
-):
-    """
-    Stores the user's .p12 certificate encrypted in MongoDB.
-
-    Security model:
-    - The .p12 bytes are encrypted with Fernet (CERT_ENCRYPTION_KEY env var) before storage.
-    - The password is validated here to confirm the file is readable, then discarded.
-    - The password is NEVER stored — the user must provide it again at submit time.
-    - Only the authenticated user can upload/overwrite their own certificate.
-    """
-    from app.services.signature_service import encrypt_p12
-    from cryptography.hazmat.primitives.serialization.pkcs12 import load_key_and_certificates
-
-    if not certificate.filename.endswith((".p12", ".pfx")):
-        raise HTTPException(status_code=400, detail="File must be a .p12 or .pfx certificate")
-
-    p12_bytes = await certificate.read()
-    if len(p12_bytes) == 0:
-        raise HTTPException(status_code=400, detail="Empty certificate file")
-
-    # Validate the .p12 is readable with the provided password
-    try:
-        pw = cert_password.encode("utf-8") if cert_password else None
-        load_key_and_certificates(p12_bytes, pw)
-    except Exception:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid certificate or wrong password. Could not open the .p12 file.",
-        )
-
-    # Encrypt and store — password is NOT stored
-    encrypted = encrypt_p12(p12_bytes)
-
-    users_collection.update_one(
-        {"_id": current_user["_id"]},
-        {
-            "$set": {
-                "p12_encrypted": encrypted,
-                "certificate_uploaded_at": datetime.utcnow(),
-                "updated_at": datetime.utcnow(),
-            }
-        },
-    )
-
-    return {
-        "message": "Certificate uploaded and stored securely. You will need to provide your password each time you submit an invoice.",
-        "filename": certificate.filename,
-        "size_bytes": len(p12_bytes),
-    }

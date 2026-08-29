@@ -27,7 +27,6 @@ from app.services.modelo_file_builder import (
     build_modelo_file,
     filing_is_legally_complete,
 )
-from app.services.signature_service import decrypt_p12
 from app.services.spain_tax_access import assert_spanish_tax_allowed
 from app.services.tax_engine_service import TaxEngineService
 
@@ -129,30 +128,12 @@ def serialize_filing(document: dict) -> dict:
     result["justificante_available"] = bool(
         (result.get("aeat_result") or {}).get("has_justificante")
     )
-    result["cert_password_from_env"] = bool(env_cert_password())
     return result
 
 
 def env_cert_password() -> str:
-    """Server .env password for the enrolled .p12. Never stored; in-memory only."""
-    for key in ("CERT_PASSWORD", "AEAT_P12_PASSWORD"):
-        value = (os.getenv(key) or "").strip()
-        if value:
-            return value
+    """Removed — Contia365 now uses its own company certificate."""
     return ""
-
-
-def resolve_cert_password(provided: Optional[str]) -> str:
-    typed = (provided or "").strip()
-    if typed:
-        return typed
-    fallback = env_cert_password()
-    if fallback:
-        return fallback
-    raise ValueError(
-        "cert_password is required for live AEAT submission "
-        "(or set CERT_PASSWORD in the server .env for the enrolled certificate)."
-    )
 
 
 class TaxFilingService:
@@ -381,11 +362,10 @@ class TaxFilingService:
         user: dict,
         comment: Optional[str],
         test_mode: bool,
-        cert_password: Optional[str] = None,
     ) -> dict:
         if test_mode:
             return self.submit_test(filing_id, user, comment)
-        return self.submit_live(filing_id, user, comment, cert_password)
+        return self.submit_live(filing_id, user, comment)
 
     def submit_test(
         self,
@@ -395,7 +375,7 @@ class TaxFilingService:
         test_mode: bool = True,
     ) -> dict:
         if not test_mode:
-            return self.submit_live(filing_id, user, comment, None)
+            return self.submit_live(filing_id, user, comment)
         filing = self._require_owner(filing_id, user)
         self._refuse_duplicate_submit(filing)
         now = datetime.utcnow()
@@ -418,7 +398,6 @@ class TaxFilingService:
         filing_id: str,
         user: dict,
         comment: Optional[str],
-        cert_password: Optional[str],
     ) -> dict:
         filing = self._require_owner(filing_id, user)
         self._refuse_duplicate_submit(filing)
@@ -430,7 +409,6 @@ class TaxFilingService:
                 f"Live AEAT submission is not implemented for Modelo {modelo}. "
                 "Use test_mode=true."
             )
-        cert_password = resolve_cert_password(cert_password)
         if modelo not in ANNUAL_FILE_MODELOS and not (
             filing.get("quarter") or filing.get("month") or filing.get("period_key")
         ):
@@ -462,11 +440,9 @@ class TaxFilingService:
         except ModeloFileError as exc:
             raise ValueError(str(exc)) from exc
 
-        p12_bytes = self._p12_bytes(user)
         aeat_response = self.aeat_modelo_client.submit(
             declaration.encode("latin-1"),
-            p12_bytes,
-            cert_password,
+            nif,
             modelo,
         )
         return self._store_aeat_outcome(filing, user, comment, aeat_response)
@@ -605,6 +581,32 @@ class TaxFilingService:
         return obligation_periodicity(profile, modelo)
 
     def _declarant_identity(self, user: dict) -> tuple[str, str]:
+        """
+        Returns (taxpayer_nif, taxpayer_name) for AEAT submission.
+
+        Business: taxpayer = the company → returns CIF + legal name.
+        Person:   taxpayer = the user    → returns personal NIF + full name.
+        """
+        from app.services.user_type_vocab import canonicalize_user_type
+        user_type = canonicalize_user_type(user.get("user_type_selection"))
+
+        if user_type == "business":
+            bp = user.get("business_profile") or {}
+            cif = str(bp.get("cif") or "").replace(" ", "").upper()
+            legal_name = str(bp.get("legal_name") or "").strip()
+            if not cif:
+                raise ValueError(
+                    "Business profile is missing the company CIF. "
+                    "Complete business onboarding step 2 first."
+                )
+            if not legal_name:
+                raise ValueError(
+                    "Business profile is missing the company legal name. "
+                    "Complete business onboarding step 2 first."
+                )
+            return cif, legal_name
+
+        # Person (autónomo) — existing logic unchanged
         identity = {}
         try:
             profile = self._profile(user)
@@ -630,23 +632,6 @@ class TaxFilingService:
         if not name:
             raise ValueError("Fiscal profile is missing the declarant name.")
         return nif, name
-
-    @staticmethod
-    def _p12_bytes(user: dict) -> bytes:
-        p12_encrypted = user.get("p12_encrypted")
-        if not p12_encrypted:
-            raise ValueError(
-                "No digital certificate found. "
-                "Upload your .p12 via POST /api/auth/certificate first."
-            )
-        try:
-            if isinstance(p12_encrypted, str):
-                p12_encrypted = p12_encrypted.encode()
-            return decrypt_p12(p12_encrypted)
-        except ValueError:
-            raise
-        except Exception as exc:
-            raise ValueError("Failed to decrypt certificate.") from exc
 
     def _store_aeat_outcome(
         self,
