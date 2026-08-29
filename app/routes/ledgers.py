@@ -46,6 +46,10 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.application import MIMEApplication
 from email.mime.text import MIMEText
 from urllib.parse import unquote
+from app.utils.ledger_display import (
+    format_bank_ledger_for_display,
+    is_invoice_issue_ledger_entry,
+)
 
 load_dotenv()
 # Set Tesseract path (Windows)
@@ -90,7 +94,8 @@ async def get_ledger_by_user(
 ):
     """
     Get all ledger entries for a specific user.
-    Fetches from both 'ledger' (OCR-based) and 'ledger_entries' (accounting-based) collections.
+    Fetches from 'ledger' (OCR/manual) and bank postings in 'ledger_entries'.
+    Issued-invoice documents in ledger_entries are excluded (they duplicate the voucher row).
     Example: GET /accounting/ledgers/user/123
     """
     try:
@@ -107,52 +112,19 @@ async def get_ledger_by_user(
             if isinstance(entry.get("created_at"), datetime):
                 entry["created_at"] = entry["created_at"].strftime("%Y-%m-%d %H:%M:%S")
 
-        # Query 2: Fetch from new 'ledger_entries' collection (accounting ledger)
+        # Query 2: Bank postings only — skip invoice-issue rows (those have invoice_id)
         ledger_entries_collection = db["ledger_entries"]
-        query_accounting = {"organization_id": organization_id}
+        query_accounting = {
+            "organization_id": organization_id,
+            "invoice_id": {"$exists": False},
+        }
         accounting_ledger_entries = list(ledger_entries_collection.find(query_accounting).sort("created_at", -1))
 
-        # Format accounting entries to match OCR ledger structure
-        formatted_accounting_entries = []
-        for entry in accounting_ledger_entries:
-            # Convert accounting ledger to display format that matches OCR structure
-            formatted_entry = {
-                "_id": str(entry["_id"]),
-                "user_id": user_id,
-                "voucher_id": entry.get("journal_entry_id", ""),
-                "file_name": f"Bank Transaction - {entry.get('reference', 'N/A')}",
-                "data_type": "bank_transaction",
-                "ocr_text": entry.get("description", ""),
-                "invoice_data": {
-                    "transaction_type": "income" if str(entry.get("entry_type", "")).lower() in ("debit", "income") else "expense",
-                    "account": {
-                        "account_code": entry.get("account_code", ""),
-                        "account_name": entry.get("account_name", "")
-                    },
-                    "invoice": {
-                        "invoice_number": entry.get("reference", ""),
-                        "invoice_date": entry.get("transaction_date").strftime("%Y-%m-%d") if isinstance(entry.get("transaction_date"), datetime) else str(entry.get("transaction_date", "")),
-                        "due_date": "",
-                        "amount_in_words": ""
-                    },
-                    "items": [
-                        {
-                            "description": entry.get("description", ""),
-                            "qty": 1,
-                            "unit_price": entry.get("amount", 0),
-                            "subtotal": entry.get("amount", 0)
-                        }
-                    ],
-                    "totals": {
-                        "total": entry.get("amount", 0),
-                        "running_balance": entry.get("running_balance", 0)
-                    }
-                },
-                "llm_error": None,
-                "processing_status": "success",
-                "created_at": entry.get("created_at").strftime("%Y-%m-%d %H:%M:%S") if isinstance(entry.get("created_at"), datetime) else str(entry.get("created_at", ""))
-            }
-            formatted_accounting_entries.append(formatted_entry)
+        formatted_accounting_entries = [
+            format_bank_ledger_for_display(entry, user_id)
+            for entry in accounting_ledger_entries
+            if not is_invoice_issue_ledger_entry(entry)
+        ]
 
         # Combine both lists
         all_entries = ocr_ledger_entries + formatted_accounting_entries
@@ -247,59 +219,23 @@ async def export_ledger_pdf(
             if isinstance(entry.get("created_at"), datetime):
                 entry["created_at"] = entry["created_at"].strftime("%Y-%m-%d %H:%M:%S")
 
-        # Query 2: Fetch from new 'ledger_entries' collection (accounting ledger)
+        # Query 2: Bank postings only — skip invoice-issue rows (those have invoice_id)
         ledger_entries_collection = db["ledger_entries"]
+        query_accounting = {
+            "organization_id": organization_id,
+            "invoice_id": {"$exists": False},
+        }
         if specific_ids:
-            # Fetch specific entries by IDs
             accounting_ids = [ObjectId(id) for id in specific_ids if ObjectId.is_valid(id)]
-            query_accounting = {"_id": {"$in": accounting_ids}, "organization_id": organization_id}
-        else:
-            # Fetch all entries for organization
-            query_accounting = {"organization_id": organization_id}
+            query_accounting["_id"] = {"$in": accounting_ids}
 
         accounting_ledger_entries = list(ledger_entries_collection.find(query_accounting).sort("created_at", -1))
 
-        # Format accounting entries to match OCR ledger structure
-        formatted_accounting_entries = []
-        for entry in accounting_ledger_entries:
-            # Convert accounting ledger to display format that matches OCR structure
-            formatted_entry = {
-                "_id": str(entry["_id"]),
-                "user_id": user_id,
-                "voucher_id": entry.get("journal_entry_id", ""),
-                "file_name": f"Bank Transaction - {entry.get('reference', 'N/A')}",
-                "data_type": "bank_transaction",
-                "ocr_text": entry.get("description", ""),
-                "invoice_data": {
-                    "transaction_type": "income" if str(entry.get("entry_type", "")).lower() in ("debit", "income") else "expense",
-                    "account": {
-                        "account_code": entry.get("account_code", ""),
-                        "account_name": entry.get("account_name", "")
-                    },
-                    "invoice": {
-                        "invoice_number": entry.get("reference", ""),
-                        "invoice_date": entry.get("transaction_date").strftime("%Y-%m-%d") if isinstance(entry.get("transaction_date"), datetime) else str(entry.get("transaction_date", "")),
-                        "due_date": "",
-                        "amount_in_words": ""
-                    },
-                    "items": [
-                        {
-                            "description": entry.get("description", ""),
-                            "qty": 1,
-                            "unit_price": entry.get("amount", 0),
-                            "subtotal": entry.get("amount", 0)
-                        }
-                    ],
-                    "totals": {
-                        "total": entry.get("amount", 0),
-                        "running_balance": entry.get("running_balance", 0)
-                    }
-                },
-                "llm_error": None,
-                "processing_status": "success",
-                "created_at": entry.get("created_at").strftime("%Y-%m-%d %H:%M:%S") if isinstance(entry.get("created_at"), datetime) else str(entry.get("created_at", ""))
-            }
-            formatted_accounting_entries.append(formatted_entry)
+        formatted_accounting_entries = [
+            format_bank_ledger_for_display(entry, user_id)
+            for entry in accounting_ledger_entries
+            if not is_invoice_issue_ledger_entry(entry)
+        ]
 
         # Combine both lists
         all_entries = ocr_ledger_entries + formatted_accounting_entries
@@ -440,6 +376,14 @@ async def update_ledger_entry(
         if result.modified_count == 0:
             raise HTTPException(status_code=500, detail="Failed to update ledger entry")
         
+        user_id = str(ledger_entry.get("user_id") or "")
+        if user_id:
+            try:
+                from app.services.tax_classification_service import TaxClassificationService
+                TaxClassificationService().classify_ledger_entry(ledger_id, user_id)
+            except Exception:
+                pass
+
         # Get updated entry
         updated_entry = ledger_collection.find_one({"_id": ObjectId(ledger_id)})
         updated_entry["_id"] = str(updated_entry["_id"])

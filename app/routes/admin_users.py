@@ -1,4 +1,4 @@
-"""Admin-only Contia pages: users directory and sales waitlist."""
+"""Admin-only Contia pages: dashboard, users directory, and sales waitlist."""
 
 from typing import Optional
 
@@ -9,6 +9,7 @@ import certifi
 from dotenv import load_dotenv
 
 from app.routes.auth import get_current_user
+from app.services.admin_dashboard_service import AdminDashboardService
 from app.services.admin_users_service import (
     ADMIN_PAGE_SIZE,
     ADMIN_PAGES,
@@ -27,6 +28,11 @@ db = client[os.getenv("DB_NAME")]
 router = APIRouter(prefix="/admin", tags=["Admin"])
 users_service = AdminUsersService(db["users"])
 waitlist_service = WaitlistService(db["waitlist"])
+dashboard_service = AdminDashboardService(
+    db["users"],
+    db["tax_filings"],
+    db["waitlist"],
+)
 
 
 def _require_admin(current_user: dict):
@@ -36,9 +42,16 @@ def _require_admin(current_user: dict):
 
 @router.get("/pages")
 def admin_pages(current_user: dict = Depends(get_current_user)):
-    """Admin UI may only render Users and Sales."""
+    """Admin UI: Dashboard, Users, and Sales."""
     _require_admin(current_user)
     return {"pages": ADMIN_PAGES}
+
+
+@router.get("/dashboard")
+def admin_dashboard(current_user: dict = Depends(get_current_user)):
+    """Platform snapshot for admin role only — not the taxpayer dashboard."""
+    _require_admin(current_user)
+    return dashboard_service.snapshot()
 
 
 @router.get("/users")

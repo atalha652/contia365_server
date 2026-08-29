@@ -6,6 +6,11 @@ Data extraction: regex patterns (no AI/LLM)
 """
 
 from fastapi import APIRouter, HTTPException, BackgroundTasks, Form, Depends
+from app.services.ocr_vouchers import (
+    build_voucher_ocr_completion_update,
+    ocr_ledger_match,
+    select_runnable_ocr_vouchers,
+)
 import io
 import re
 import os
@@ -49,6 +54,20 @@ _classifier = TaxClassificationService()
 _ai_analyzer = AIModeloAnalyzer()
 
 router = APIRouter(prefix="/accounting/ocr", tags=["OCR"])
+
+
+def upsert_ocr_ledger(match: dict, document: dict) -> str:
+    """Insert or replace the OCR ledger row for one voucher file (idempotent re-run)."""
+    existing = ledger_collection.find_one(match)
+    now = datetime.utcnow()
+    if existing:
+        update_doc = {key: value for key, value in document.items() if key != "created_at"}
+        update_doc["updated_at"] = now
+        ledger_collection.update_one({"_id": existing["_id"]}, {"$set": update_doc})
+        return str(existing["_id"])
+    document.setdefault("created_at", now)
+    result = ledger_collection.insert_one(document)
+    return str(result.inserted_id)
 
 
 def ocr_with_ocrspace(file_bytes: bytes, file_ext: str = "jpg") -> str:
@@ -384,7 +403,9 @@ def process_single_voucher(voucher: dict, user_id: str, period: str) -> dict:
                 entry_type = "credit" if tx_type == "income" else "debit"
                 amount = invoice_data.get("totals", {}).get("Total_with_Tax", 0)
                 
-                ledger_result = ledger_collection.insert_one({
+                ledger_id = upsert_ocr_ledger(
+                    ocr_ledger_match(voucher_id, "toon", file_name=file_name),
+                    {
                     "user_id": user_id,
                     "organization_id": user_id,
                     "voucher_id": voucher_id,
@@ -406,8 +427,8 @@ def process_single_voucher(voucher: dict, user_id: str, period: str) -> dict:
                     "transaction_date": datetime.utcnow(),
                     "description": f"TOON: {file_name}",
                     "created_at": datetime.utcnow(),
-                })
-                ledger_id = str(ledger_result.inserted_id)
+                    },
+                )
                 # ── Tax Classification Layer ──────────────────────────────
                 try:
                     _classifier.classify_ledger_entry(ledger_id, user_id)
@@ -483,7 +504,9 @@ def process_single_voucher(voucher: dict, user_id: str, period: str) -> dict:
                 entry_type = "credit" if tx_type == "income" else "debit"
                 amount = invoice_data.get("totals", {}).get("Total_with_Tax", 0)
                 
-                ledger_result = ledger_collection.insert_one({
+                ledger_id = upsert_ocr_ledger(
+                    ocr_ledger_match(voucher_id, "file", s3_key=s3_key),
+                    {
                     "user_id": user_id,
                     "organization_id": user_id,
                     "voucher_id": voucher_id,
@@ -505,8 +528,8 @@ def process_single_voucher(voucher: dict, user_id: str, period: str) -> dict:
                     "transaction_date": datetime.utcnow(),
                     "description": f"Invoice from {invoice_data.get('supplier', {}).get('business_name', 'Unknown')}",
                     "created_at": datetime.utcnow(),
-                })
-                ledger_id = str(ledger_result.inserted_id)
+                    },
+                )
                 # ── Tax Classification Layer ──────────────────────────────
                 try:
                     _classifier.classify_ledger_entry(ledger_id, user_id)
@@ -570,10 +593,15 @@ def process_single_voucher(voucher: dict, user_id: str, period: str) -> dict:
     
     print(f"[OCR] Voucher {voucher_id} final status: {ocr_status} ({len(results)} files processed)")
 
-    voucher_collection.update_one(
-        {"_id": ObjectId(voucher_id)},
-        {"$set": {"OCR": ocr_status, "ocr_completed_at": datetime.utcnow()}},
+    voucher_doc = voucher_collection.find_one({"_id": ObjectId(voucher_id)}, {"status": 1})
+    completion_update = build_voucher_ocr_completion_update(
+        user_id,
+        ocr_status,
+        voucher_doc.get("status") if voucher_doc else None,
     )
+    voucher_collection.update_one({"_id": ObjectId(voucher_id)}, {"$set": completion_update})
+    if completion_update.get("status") == "approved":
+        print(f"[OCR] ✅ Voucher {voucher_id} auto-approved after OCR")
     return {"voucher_id": voucher_id, "file_count": len(results), "ocr_status": ocr_status, "files": results}
 
 
@@ -587,7 +615,12 @@ def process_vouchers_background(job_id: str, user_id: str, voucher_object_ids: l
             {"$set": {"status": "processing", "started_at": datetime.utcnow()}},
         )
         vouchers = list(voucher_collection.find(
-            {"_id": {"$in": voucher_object_ids}, "user_id": user_id},
+            {
+                "_id": {"$in": voucher_object_ids},
+                "user_id": user_id,
+                "source": {"$ne": "manual"},
+                "OCR": {"$ne": "not_applicable"},
+            },
             {"files": 1},
         ))
         print(f"[OCR JOB] {len(vouchers)} vouchers found")
@@ -636,15 +669,42 @@ async def start_voucher_ocr(
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid voucher ID format")
 
-    count = voucher_collection.count_documents({"_id": {"$in": voucher_object_ids}, "user_id": user_id})
-    if count == 0:
+    docs = list(voucher_collection.find(
+        {"_id": {"$in": voucher_object_ids}, "user_id": user_id}
+    ))
+    if not docs:
         raise HTTPException(status_code=404, detail="No vouchers found")
+    split = select_runnable_ocr_vouchers(docs)
+    runnable = split["runnable"]
+    if not runnable:
+        if split["skipped_processing"]:
+            raise HTTPException(
+                status_code=409,
+                detail="OCR is already running for the selected voucher(s)",
+            )
+        if split["skipped_manual"]:
+            raise HTTPException(
+                status_code=400,
+                detail="Selected vouchers were entered by hand and do not use OCR",
+            )
+        raise HTTPException(status_code=400, detail="No vouchers available for OCR")
+    voucher_object_ids = [d["_id"] for d in runnable]
+    count = len(runnable)
 
-    job    = ocr_jobs_collection.insert_one({"user_id": user_id, "voucher_ids": voucher_id_list, "status": "awaiting", "total_vouchers": count, "period": period, "created_at": datetime.utcnow()})
+    job    = ocr_jobs_collection.insert_one({"user_id": user_id, "voucher_ids": [str(i) for i in voucher_object_ids], "status": "awaiting", "total_vouchers": count, "period": period, "created_at": datetime.utcnow()})
     job_id = str(job.inserted_id)
     background_tasks.add_task(process_vouchers_background, job_id, user_id, voucher_object_ids, period)
 
-    return {"message": "OCR processing started", "job_id": job_id, "user_id": user_id, "total_vouchers": count, "status": "awaiting", "check_status_url": f"/accounting/ocr/job/{job_id}"}
+    return {
+        "message": "OCR processing started",
+        "job_id": job_id,
+        "user_id": user_id,
+        "total_vouchers": count,
+        "status": "awaiting",
+        "skipped_manual": len(split["skipped_manual"]),
+        "skipped_processing": len(split["skipped_processing"]),
+        "check_status_url": f"/accounting/ocr/job/{job_id}",
+    }
 
 
 @router.get("/job/{job_id}")

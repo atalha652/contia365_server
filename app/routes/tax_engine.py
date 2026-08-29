@@ -12,7 +12,7 @@ POST /tax-engine/backfill              → Classify all unclassified entries for
 """
 
 from fastapi import APIRouter, HTTPException, Depends, Query
-from typing import Optional
+from typing import List, Optional
 from pydantic import BaseModel, Field
 
 from app.models.tax_engine import (
@@ -204,6 +204,13 @@ async def calculate_modelo_190(
 
 # ── Classification Layer endpoints ────────────────────────────────────────────
 
+class ClassifyOverrideRequest(BaseModel):
+    modelo_nos: Optional[List[str]] = None
+    operation_type: Optional[str] = None
+    withholding_type: Optional[str] = None
+    clear_override: bool = False
+
+
 @router.post("/classify/{ledger_id}")
 async def classify_ledger_entry(
     ledger_id: str,
@@ -224,6 +231,37 @@ async def classify_ledger_entry(
         }
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.patch("/classify/{ledger_id}")
+async def override_ledger_classification(
+    ledger_id: str,
+    body: ClassifyOverrideRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Set tax nature and/or lock which modelos this ledger entry belongs to."""
+    user_id = str(current_user["_id"])
+    try:
+        result = _classifier.override_classification(
+            ledger_id,
+            user_id,
+            modelo_nos=body.modelo_nos,
+            operation_type=body.operation_type,
+            withholding_type=body.withholding_type,
+            clear_override=body.clear_override,
+        )
+        return {
+            "ledger_id": ledger_id,
+            "modelo_ids": result["modelo_ids"],
+            "matched_modelos": result["matched_modelos"],
+            "signals": result["signals"],
+            "user_override": result.get("user_override", False),
+        }
+    except ValueError as e:
+        status = 404 if "not found" in str(e).lower() else 400
+        raise HTTPException(status_code=status, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 

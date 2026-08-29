@@ -24,7 +24,22 @@ from app.models.tax_engine import (
 )
 from app.repos.tax_engine_repo import TaxEngineRepository
 from app.repos.tax_percipient_repo import TaxPercipientRepository
+from app.services.fiscal_profile_service import get_canonical_fiscal_profile
+from app.services.irpf_130 import modelo_130_payable, resolve_modelo_130_rate
 from app.services.tax_period import resolve_tax_period
+from app.services.vat_303 import (
+    apply_vat_line,
+    classify_303_line,
+    empty_vat_accumulator,
+    finalize_vat_accumulator,
+    is_recargo_rate,
+    is_prorrata_especial,
+    is_regimen_simplificado,
+    modelo_303_payable,
+    parse_prorrata_percent,
+    snap_recargo_rate,
+    snap_rg_vat_rate,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +90,22 @@ def _extract_amounts(entry: dict) -> dict:
     vat_amount     = float(totals.get("VAT_amount") or 0)
     vat_rate       = float(totals.get("VAT_rate") or 0)
     irpf_retention = float(totals.get("IRPF_amount") or 0)
+    recargo_rate   = float(totals.get("recargo_rate") or totals.get("RECARGO_rate") or 0)
+    recargo_amount = float(totals.get("recargo_amount") or totals.get("RECARGO_amount") or 0)
     total_with_tax = float(totals.get("Total_with_Tax") or totals.get("total") or 0)
+    ocr_text = entry.get("ocr_text") or ""
+    stored_regime = str(
+        totals.get("vat_regime")
+        or invoice_data.get("vat_regime")
+        or invoice_data.get("vat_special")
+        or ""
+    )
+    operation_type = str(
+        invoice_data.get("operation_type")
+        or totals.get("operation_type")
+        or stored_regime
+        or ""
+    )
 
     # Fallback for legacy entries that don't have the "base" field:
     # only recalculate if base is missing AND vat_amount looks like a real amount (not the rate)
@@ -101,6 +131,11 @@ def _extract_amounts(entry: dict) -> dict:
         "vat_amount":       vat_amount,
         "vat_rate":         vat_rate,
         "irpf_retention":   irpf_retention,
+        "recargo_rate":     recargo_rate,
+        "recargo_amount":   recargo_amount,
+        "vat_regime":       stored_regime,
+        "operation_type":   operation_type,
+        "ocr_text":         ocr_text,
         "total_with_tax":   total_with_tax,
     }
 
@@ -122,10 +157,7 @@ def _empty_vat_by_rate() -> dict:
 
 def _bucket_vat_rate(rate: float) -> str:
     """Snap a stored rate onto the Spanish 21 / 10 / 4 / 0 split."""
-    if rate is None or rate <= 0:
-        return "0"
-    nearest = min(_STANDARD_VAT_RATES, key=lambda standard: abs(standard - rate))
-    return str(nearest)
+    return snap_rg_vat_rate(rate)
 
 
 def _is_income(tx_type: str) -> bool:
@@ -238,7 +270,8 @@ class TaxEngineService:
         """
         Aggregate VAT for entries pre-classified as belonging to modelo_id.
 
-        vatPayable = outputVAT (income) - inputVAT (expense)
+        Régimen general: output − input at 21/10/4/0.
+        Also routes ISP, intra-community, recargo, imports, used-goods, prorrata.
         Monthly (REDEME) filers pass month 1-12; quarterly filers pass Q1-Q4.
         """
         self._require_applicable_modelo(user_id, "303")
@@ -255,8 +288,17 @@ class TaxEngineService:
         raw        = self._get_entries_for_modelo(user_id, organization_id, modelo_id, start, end)
         entries    = self._filter_by_invoice_date(raw, start, end)
 
-        totals = Modelo303Results()
+        try:
+            profile = get_canonical_fiscal_profile(self.repo.users, self.repo.census_data, user_id)
+        except Exception:
+            profile = None
+
+        totals = Modelo303Results(
+            prorrata_percent=parse_prorrata_percent(profile),
+            prorrata_especial=is_prorrata_especial(profile),
+        )
         vat_by_rate = _empty_vat_by_rate()
+        recargo_by_rate: dict = {}
         count  = 0
 
         for entry in entries:
@@ -264,23 +306,106 @@ class TaxEngineService:
             if a["total_with_tax"] == 0:
                 continue
             count += 1
-            bucket = vat_by_rate[_bucket_vat_rate(a["vat_rate"])]
-            if _is_income(a["transaction_type"]):
+            regime = classify_303_line(
+                vat_rate=a["vat_rate"],
+                recargo_rate=a["recargo_rate"],
+                recargo_amount=a["recargo_amount"],
+                text=a["ocr_text"],
+                stored_regime=a["vat_regime"],
+                stored_operation_type=a.get("operation_type") or "",
+            )
+            income = _is_income(a["transaction_type"])
+
+            if regime == "isp":
+                totals.isp_base += a["base_amount"]
+                totals.isp_vat += a["vat_amount"]
+                continue
+            if regime == "intra":
+                totals.intra_base += a["base_amount"]
+                totals.intra_vat += a["vat_amount"]
+                continue
+            if regime == "import":
+                totals.import_base += a["base_amount"]
+                totals.import_vat += a["vat_amount"]
+                continue
+            if regime == "used_goods":
+                totals.used_goods_base += a["base_amount"]
+                continue
+            if regime == "investment":
+                totals.investment_base += a["base_amount"]
+                totals.investment_vat += a["vat_amount"]
+                continue
+
+            recargo_amt = a["recargo_amount"]
+            recargo_rate = a["recargo_rate"]
+            rg_rate = a["vat_rate"]
+            rg_vat = a["vat_amount"]
+            if is_recargo_rate(rg_rate) and recargo_amt <= 0:
+                recargo_amt = rg_vat
+                recargo_rate = rg_rate
+                rg_vat = 0.0
+                rg_rate = 0.0
+            if recargo_amt > 0 or recargo_rate > 0:
+                if recargo_amt <= 0 and recargo_rate:
+                    recargo_amt = round(a["base_amount"] * recargo_rate / 100.0, 2)
+                rate_for_slot = recargo_rate
+                if rate_for_slot <= 0 and a["base_amount"] > 0 and recargo_amt > 0:
+                    rate_for_slot = recargo_amt / a["base_amount"] * 100.0
+                if rate_for_slot <= 0:
+                    rate_for_slot = 5.2
+                slot = str(snap_recargo_rate(rate_for_slot))
+                bucket_re = recargo_by_rate.setdefault(slot, {"base": 0.0, "vat": 0.0})
+                bucket_re["base"] += a["base_amount"]
+                bucket_re["vat"] += recargo_amt
+                if rg_vat <= 0:
+                    continue
+
+            bucket = vat_by_rate[_bucket_vat_rate(rg_rate)]
+            if income:
                 totals.total_sales += a["base_amount"]
-                totals.output_vat  += a["vat_amount"]
+                totals.output_vat += rg_vat
                 bucket["output_base"] += a["base_amount"]
-                bucket["output_vat"]  += a["vat_amount"]
+                bucket["output_vat"] += rg_vat
             else:
                 totals.total_expenses += a["base_amount"]
-                totals.input_vat      += a["vat_amount"]
+                totals.input_vat += rg_vat
                 bucket["input_base"] += a["base_amount"]
-                bucket["input_vat"]  += a["vat_amount"]
+                bucket["input_vat"] += rg_vat
 
         totals.total_sales    = round(totals.total_sales, 2)
         totals.total_expenses = round(totals.total_expenses, 2)
         totals.output_vat     = round(totals.output_vat, 2)
         totals.input_vat      = round(totals.input_vat, 2)
-        totals.vat_payable    = round(totals.output_vat - totals.input_vat, 2)
+        totals.isp_base = round(totals.isp_base, 2)
+        totals.isp_vat = round(totals.isp_vat, 2)
+        totals.intra_base = round(totals.intra_base, 2)
+        totals.intra_vat = round(totals.intra_vat, 2)
+        totals.import_base = round(totals.import_base, 2)
+        totals.import_vat = round(totals.import_vat, 2)
+        totals.investment_base = round(totals.investment_base, 2)
+        totals.investment_vat = round(totals.investment_vat, 2)
+        totals.used_goods_base = round(totals.used_goods_base, 2)
+        totals.recargo_by_rate = {
+            rate: {"base": round(vals["base"], 2), "vat": round(vals["vat"], 2)}
+            for rate, vals in recargo_by_rate.items()
+        }
+        totals.recargo_vat = round(sum(v["vat"] for v in totals.recargo_by_rate.values()), 2)
+        totals.vat_payable = modelo_303_payable(
+            totals.output_vat,
+            totals.input_vat,
+            isp_vat=totals.isp_vat,
+            intra_vat=totals.intra_vat,
+            recargo_vat=totals.recargo_vat,
+            import_vat=totals.import_vat,
+            investment_vat=totals.investment_vat,
+            prorrata_percent=totals.prorrata_percent,
+        )
+        factor = max(0.0, min(100.0, totals.prorrata_percent)) / 100.0
+        totals.input_vat_deductible = round(
+            (totals.input_vat + totals.isp_vat + totals.intra_vat + totals.import_vat + totals.investment_vat)
+            * factor,
+            2,
+        )
         totals.vat_by_rate = {
             rate: {field: round(value, 2) for field, value in bucket.items()}
             for rate, bucket in vat_by_rate.items()
@@ -315,16 +440,21 @@ class TaxEngineService:
         year: int, quarter: Quarter, modelo_id: str
     ) -> Modelo130Response:
         """
-        IRPF pago fraccionado.
-        taxableIncome = income - expenses
-        irpfPayable   = max(0, taxableIncome × 20%) - already_withheld
+        IRPF pago fraccionado (official 130 is year-to-date).
+        taxableIncome = YTD income - YTD expenses
+        irpfPayable   = max(0, taxableIncome × régimen rate − withheld − prior 130 payments)
         """
         self._require_applicable_modelo(user_id, "130")
-        start, end = _quarter_date_range(year, quarter)
-        raw        = self._get_entries_for_modelo(user_id, organization_id, modelo_id, start, end)
-        entries    = self._filter_by_invoice_date(raw, start, end)
+        year_start, _ = _quarter_date_range(year, Quarter.Q1)
+        _, end = _quarter_date_range(year, quarter)
+        raw        = self._get_entries_for_modelo(user_id, organization_id, modelo_id, year_start, end)
+        entries    = self._filter_by_invoice_date(raw, year_start, end)
 
-        totals = Modelo130Results()
+        try:
+            profile = get_canonical_fiscal_profile(self.repo.users, self.repo.census_data, user_id)
+        except Exception:
+            profile = None
+        totals = Modelo130Results(irpf_rate=resolve_modelo_130_rate(profile, year))
         count  = 0
 
         for entry in entries:
@@ -348,8 +478,12 @@ class TaxEngineService:
             if report_q and report_q < str(quarter.value if hasattr(quarter, "value") else quarter):
                 prior += float((report.get("results") or {}).get("irpf_payable") or 0)
         totals.prior_payments = round(max(0.0, prior), 2)
-        gross_irpf                   = round(max(0.0, totals.taxable_income * totals.irpf_rate), 2)
-        totals.irpf_payable          = round(max(0.0, gross_irpf - totals.irpf_already_withheld), 2)
+        totals.irpf_payable = modelo_130_payable(
+            totals.taxable_income,
+            totals.irpf_rate,
+            totals.irpf_already_withheld,
+            totals.prior_payments,
+        )
 
         report = TaxReport(
             user_id=user_id, organization_id=organization_id,
@@ -383,8 +517,8 @@ class TaxEngineService:
     ):
         """
         Rent IRPF withholding.
-        Aggregates IRPF retention amounts from rent invoices.
-        withholding_payable = sum of irpf_retention values found in OCR text.
+        withholding_payable = sum of IRPF amounts printed on the invoices.
+        Missing / 0 IRPF is 0 — do not invent 19% of the rent base.
         """
         from app.models.tax_engine import Modelo115Results, Modelo115Response
         self._require_applicable_modelo(user_id, "115")
@@ -400,16 +534,15 @@ class TaxEngineService:
             if a["total_with_tax"] == 0:
                 continue
             count += 1
-            totals.total_rent_base   += a["base_amount"]
-            # Use explicitly extracted IRPF retention if present,
-            # otherwise apply standard 19% retention rate
-            if a["irpf_retention"] > 0:
-                totals.withholding_payable += a["irpf_retention"]
-            else:
-                totals.withholding_payable += round(a["base_amount"] * totals.retention_rate, 2)
+            totals.total_rent_base += a["base_amount"]
+            totals.withholding_payable += max(0.0, a["irpf_retention"])
 
         totals.total_rent_base     = round(totals.total_rent_base, 2)
         totals.withholding_payable = round(totals.withholding_payable, 2)
+        if totals.total_rent_base > 0 and totals.withholding_payable > 0:
+            totals.retention_rate = round(totals.withholding_payable / totals.total_rent_base, 4)
+        else:
+            totals.retention_rate = 0.0
         totals.percipient_count = 1 if totals.withholding_payable or totals.total_rent_base else 0
 
         report = TaxReport(
@@ -494,7 +627,7 @@ class TaxEngineService:
         year: int, modelo_id: str
     ):
         """
-        Annual VAT summary — aggregates all 4 quarters.
+        Annual VAT summary — same regime split as 303 across the full year.
         Also reads previously saved 303 quarterly reports to compute
         quarterly_payments already made.
         """
@@ -505,8 +638,12 @@ class TaxEngineService:
         raw     = self._get_entries_for_modelo(user_id, organization_id, modelo_id, start, end)
         entries = self._filter_by_invoice_date(raw, start, end)
 
-        totals = Modelo390Results()
-        vat_by_rate = _empty_vat_by_rate()
+        try:
+            profile = get_canonical_fiscal_profile(self.repo.users, self.repo.census_data, user_id)
+        except Exception:
+            profile = None
+        prorrata = parse_prorrata_percent(profile)
+        acc = empty_vat_accumulator()
         count  = 0
 
         for entry in entries:
@@ -514,27 +651,14 @@ class TaxEngineService:
             if a["total_with_tax"] == 0:
                 continue
             count += 1
-            bucket = vat_by_rate[_bucket_vat_rate(a["vat_rate"])]
-            if _is_income(a["transaction_type"]):
-                totals.total_sales += a["base_amount"]
-                totals.output_vat  += a["vat_amount"]
-                bucket["output_base"] += a["base_amount"]
-                bucket["output_vat"]  += a["vat_amount"]
-            else:
-                totals.total_expenses += a["base_amount"]
-                totals.input_vat      += a["vat_amount"]
-                bucket["input_base"] += a["base_amount"]
-                bucket["input_vat"]  += a["vat_amount"]
+            apply_vat_line(acc, a, income=_is_income(a["transaction_type"]))
 
-        totals.total_sales    = round(totals.total_sales, 2)
-        totals.total_expenses = round(totals.total_expenses, 2)
-        totals.output_vat     = round(totals.output_vat, 2)
-        totals.input_vat      = round(totals.input_vat, 2)
-        totals.net_vat        = round(totals.output_vat - totals.input_vat, 2)
-        totals.vat_by_rate = {
-            rate: {field: round(value, 2) for field, value in bucket.items()}
-            for rate, bucket in vat_by_rate.items()
-        }
+        finalized = finalize_vat_accumulator(acc, prorrata)
+        totals = Modelo390Results(
+            **finalized,
+            prorrata_especial=is_prorrata_especial(profile),
+            regimen_simplificado=is_regimen_simplificado(profile),
+        )
 
         # Sum quarterly 303 payments already filed
         quarterly_reports = self.repo.list_tax_reports_by_modelo_no(user_id, "303", year)

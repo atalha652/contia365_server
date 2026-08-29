@@ -1,12 +1,62 @@
 """Build OCR-compatible invoice_data from a typed (manual) voucher payload."""
 
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Dict, Any
 
 from pydantic import AliasChoices, BaseModel, ConfigDict, Field, model_validator
 
 
 def round_money(value: float) -> float:
     return round(float(value or 0), 2)
+
+
+def is_manual_voucher(doc: Optional[Dict[str, Any]]) -> bool:
+    """True when the voucher was typed in (no scan, no OCR)."""
+    if not doc:
+        return False
+    if str(doc.get("source") or "").lower() == "manual":
+        return True
+    return str(doc.get("OCR") or "").lower() == "not_applicable"
+
+
+def expenses_list_query(user_id: str) -> dict:
+    """Expenses page: file scans (upload → OCR → auto-approve → invoice) + typed expenses."""
+    scan_base = {
+        "source": {"$ne": "manual"},
+        "OCR": {"$ne": "not_applicable"},
+    }
+    return {
+        "user_id": user_id,
+        "$or": [
+            {
+                **scan_base,
+                "status": {"$in": ["pending", "rejected", "awaiting_approval"]},
+            },
+            {
+                **scan_base,
+                "status": "approved",
+                "$or": [
+                    {"invoice_id": {"$exists": False}},
+                    {"invoice_id": None},
+                ],
+            },
+            {"source": "manual", "status": "approved"},
+            {
+                "OCR": "not_applicable",
+                "status": "approved",
+                "source": {"$ne": "manual"},
+            },
+        ],
+    }
+
+
+def execution_list_query(user_id: str) -> dict:
+    """Execution is OCR work only — typed expenses stay off this page."""
+    return {
+        "user_id": user_id,
+        "status": "approved",
+        "source": {"$ne": "manual"},
+        "OCR": {"$ne": "not_applicable"},
+    }
 
 
 class ManualParty(BaseModel):
@@ -68,6 +118,8 @@ class ManualVoucherCreate(BaseModel):
     invoice_date: Optional[str] = None
     items: List[ManualLineItem]
     totals: Optional[ManualTotals] = None
+    operation_type: Optional[str] = None
+    withholding_type: Optional[str] = None
 
     @model_validator(mode="after")
     def validate_manual(self):
@@ -164,7 +216,7 @@ def build_manual_invoice_data(body: ManualVoucherCreate) -> dict:
     supplier_name = party_display_name(body.supplier, "business_name")
     customer_name = party_display_name(body.customer, "company_name")
 
-    return {
+    result = {
         "transaction_type": nested_tx,
         "supplier": _party_doc(body.supplier, "business_name", supplier_name),
         "customer": _party_doc(body.customer, "company_name", customer_name),
@@ -175,6 +227,10 @@ def build_manual_invoice_data(body: ManualVoucherCreate) -> dict:
             "amount_in_words": "N/A",
         },
         "items": line_items,
+        "operation_type": body.operation_type or "general",
+        "withholding_type": body.withholding_type or (
+            "irpf_work" if irpf_total > 0 else "none"
+        ),
         "totals": {
             "base": base_total,
             "total": base_total,
@@ -183,8 +239,13 @@ def build_manual_invoice_data(body: ManualVoucherCreate) -> dict:
             "IRPF_rate": irpf_rate,
             "IRPF_amount": irpf_total,
             "Total_with_Tax": payable,
+            "vat_regime": body.operation_type or "general",
         },
     }
+
+    from app.services.tax_nature import persistable_nature
+    seeded, _ = persistable_nature(result)
+    return seeded
 
 
 def manual_ocr_text(invoice_data: dict) -> str:

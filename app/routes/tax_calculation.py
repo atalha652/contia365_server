@@ -86,7 +86,7 @@ def get_irpf_summary(
     start_date: date = Query(..., description="Quarter start date"),
     end_date: date = Query(..., description="Quarter end date"),
     quarter: int = Query(..., ge=1, le=4, description="Quarter number (1-4)"),
-    irpf_rate: Optional[Decimal] = Query(Decimal("20"), description="IRPF rate percentage"),
+    irpf_rate: Optional[Decimal] = Query(None, description="IRPF rate percentage; omit to use régimen"),
     current_user: dict = Depends(get_current_user),
     tax_service: TaxCalculationService = Depends(get_tax_service)
 ):
@@ -97,8 +97,7 @@ def get_irpf_summary(
     - Gross Income
     - Deductible Expenses
     - Net Income = Gross Income - Deductible Expenses
-    - IRPF Payable = Net Income * IRPF Rate
-    - IRPF to Pay (considering previous quarters)
+    - IRPF Payable = Net Income * régimen rate − prior 130 payments
     """
     try:
         organization_id = current_user.get("organization_id") or current_user["_id"]
@@ -108,7 +107,8 @@ def get_irpf_summary(
             start_date=start_date,
             end_date=end_date,
             quarter=quarter,
-            irpf_rate=irpf_rate
+            irpf_rate=irpf_rate,
+            user_id=str(current_user["_id"]),
         )
         
         return summary
@@ -387,7 +387,7 @@ def get_irpf_summary_public(
     end_date: date = Query(..., description="Quarter end date"),
     quarter: int = Query(..., ge=1, le=4, description="Quarter number (1-4)"),
     organization_id: str = Query(..., description="Organization/User ID"),
-    irpf_rate: Optional[Decimal] = Query(Decimal("20"), description="IRPF rate percentage"),
+    irpf_rate: Optional[Decimal] = Query(None, description="IRPF rate percentage; omit to use régimen"),
     tax_service: TaxCalculationService = Depends(get_tax_service)
 ):
     """
@@ -400,7 +400,8 @@ def get_irpf_summary_public(
             start_date=start_date,
             end_date=end_date,
             quarter=quarter,
-            irpf_rate=irpf_rate
+            irpf_rate=irpf_rate,
+            user_id=organization_id,
         )
         return summary
     except Exception as e:

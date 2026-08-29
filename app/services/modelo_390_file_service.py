@@ -1,7 +1,8 @@
 """Modelo 390 official file — identification + régimen general page (2025 OCA layout).
 
-Remaining 390 pages are out of scope (ISP / simplified / recargo). Page 02 maps
-engine VAT buckets onto RG 0/4/10/21 casillas.
+Page 02 maps RG 0/4/10/21 plus ISP, intra-community and recargo into the
+unused liquidation slots after 21%. Simplified modules are flagged on totals
+only (no module indexes to compute).
 """
 
 from __future__ import annotations
@@ -86,8 +87,29 @@ def build_page_02(*, totals: Modelo390Results) -> str:
     put(buf, 200, signed(b10.output_vat, 17))   # [04]
     put(buf, 217, signed(b21.output_base, 17))  # [05]
     put(buf, 234, signed(b21.output_vat, 17))   # [06]
+    intra_base = float(getattr(totals, "intra_base", 0) or 0)
+    intra_vat = float(getattr(totals, "intra_vat", 0) or 0)
+    isp_base = float(getattr(totals, "isp_base", 0) or 0)
+    isp_vat = float(getattr(totals, "isp_vat", 0) or 0)
+    recargo_vat = float(getattr(totals, "recargo_vat", 0) or 0)
+    recargo_base = 0.0
+    for bucket in (getattr(totals, "recargo_by_rate", None) or {}).values():
+        if isinstance(bucket, Mapping):
+            recargo_base += float(bucket.get("base") or 0)
+        else:
+            recargo_base += float(getattr(bucket, "base", 0) or 0)
+    # Unused RG slots after 21% — ISP / intra / recargo (previously left zero).
+    put(buf, 251, signed(intra_base, 17))
+    put(buf, 268, signed(intra_vat, 17))
+    put(buf, 285, signed(isp_base, 17))
+    put(buf, 302, signed(isp_vat, 17))
+    put(buf, 319, signed(recargo_base, 17))
+    put(buf, 336, signed(recargo_vat, 17))
+    accrued = round(
+        float(totals.output_vat or 0) + isp_vat + intra_vat + recargo_vat, 2
+    )
     put(buf, 1611, signed(totals.total_sales or 0, 17))  # [33]
-    put(buf, 1628, signed(totals.output_vat or 0, 17))  # [34]
+    put(buf, 1628, signed(accrued, 17))  # [34] RG output + specials
     put(buf, 1645, " " * 150)
     put(buf, 1795, "</T39002000>")
     return "".join(buf)

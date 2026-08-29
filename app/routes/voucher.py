@@ -30,7 +30,13 @@ from fastapi import Query
 from fastapi.responses import FileResponse
 from app.utils.period_guard import require_open_period, validate_upload_window
 from app.services.tax_classification_service import TaxClassificationService
-from app.services.manual_voucher import ManualVoucherCreate, build_manual_invoice_data, manual_ocr_text
+from app.services.manual_voucher import (
+    ManualVoucherCreate,
+    build_manual_invoice_data,
+    expenses_list_query,
+    execution_list_query,
+    manual_ocr_text,
+)
 # Load env variables
 load_dotenv()
 
@@ -195,6 +201,7 @@ async def upload_voucher(
 async def create_manual_voucher(body: ManualVoucherCreate):
     """
     JSON-only voucher create. Does not accept files and does not run OCR.
+    Typed expenses are approved on save and get a draft invoice immediately.
     Scan uploads stay on POST /accounting/voucher/upload.
     """
     period = require_open_period(body.period)
@@ -204,7 +211,7 @@ async def create_manual_voucher(body: ManualVoucherCreate):
 
     new_voucher = {
         "user_id": body.user_id,
-        "status": "pending",
+        "status": "approved",
         "OCR": "not_applicable",
         "source": "manual",
         "period": period,
@@ -212,6 +219,8 @@ async def create_manual_voucher(body: ManualVoucherCreate):
         "files": [],
         "invoice_data": invoice_data,
         "created_at": now,
+        "approved_at": now,
+        "updated_at": now,
     }
     if body.title:
         new_voucher["title"] = body.title
@@ -262,20 +271,32 @@ async def create_manual_voucher(body: ManualVoucherCreate):
     except Exception as te:
         print(f"[TaxCalc] manual entry {ledger_id}: {te}")
 
+    voucher_patch = {"ledger_id": ledger_id}
+
+    invoice_id = None
+    try:
+        from app.services.invoice_service import InvoiceService
+        created_invoice = InvoiceService(db).create_from_voucher(body.user_id, voucher_id)
+        invoice_id = created_invoice.id
+        voucher_patch["invoice_id"] = invoice_id
+    except Exception as ie:
+        print(f"[Invoice] manual voucher {voucher_id}: {ie}")
+
     voucher_collection.update_one(
         {"_id": result.inserted_id},
-        {"$set": {"ledger_id": ledger_id}},
+        {"$set": voucher_patch},
     )
 
     return {
         "message": "Manual voucher created successfully",
         "voucher_id": voucher_id,
         "ledger_id": ledger_id,
+        "invoice_id": invoice_id,
         "tax_transaction_id": tax_tx_id,
         "user_id": body.user_id,
         "period": period,
         "source": "manual",
-        "status": "pending",
+        "status": "approved",
         "OCR": "not_applicable",
         "transaction_type": body.transaction_type,
         "title": body.title,
@@ -331,10 +352,7 @@ async def get_approved_vouchers(
     Get all vouchers for a specific user with status 'approved'.
     Example: GET /accounting/voucher/approved?user_id=123
     """
-    query = {
-        "user_id": user_id,
-        "status": "approved"
-    }
+    query = execution_list_query(user_id)
 
     vouchers = list(voucher_collection.find(query).sort("approved_at", -1))
 
@@ -445,18 +463,13 @@ async def get_vouchers(
     user_id: str = Query(..., description="User ID to fetch vouchers for")
 ):
     """
-    Get all vouchers for a specific user with status 'pending' or 'rejected'.
+    Expenses page list: scans in workflow (pending through approved, pre-invoice)
+    plus completed typed expenses. OCR can be started from this list before or after approval.
     Example: GET /accounting/voucher?user_id=123
     """
-    query = {
-        "user_id": user_id,
-        "status": {"$in": ["pending", "rejected"]}
-    }
+    query = expenses_list_query(user_id)
 
-    vouchers = list(voucher_collection.find(query))
-
-    if not vouchers:
-        raise HTTPException(status_code=404, detail="No vouchers found with status 'pending' or 'rejected'")
+    vouchers = list(voucher_collection.find(query).sort("created_at", -1))
 
     # Convert ObjectId and datetime for readability
     for voucher in vouchers:

@@ -14,11 +14,12 @@ Pipeline:
                                               Tax engine reads modelo_ids only
 
 Signal extraction (from ledger entry):
-  - has_vat          : VAT amount > 0
-  - has_irpf         : "retención" / "irpf" keyword in OCR text
+  - has_vat          : VAT amount / totals (not wording)
+  - has_irpf         : IRPF amount or withholding_type
   - transaction_type : "income" | "expense"
-  - is_rent          : "alquiler" / "rent" keyword
-  - is_professional  : "honorarios" / "servicios profesionales" keyword
+  - is_rent          : withholding_type == rental
+  - is_professional  : withholding_type professional / irpf_work
+  - operation_type   : stored tax nature (ISP, intra, recargo, …)
 
 Matching strategy (fully data-driven):
   Each modelo in the modelos collection has a `name` field.
@@ -38,6 +39,13 @@ from typing import List, Dict, Optional
 from bson import ObjectId
 from pymongo import MongoClient
 from app.services.fiscal_profile_service import get_canonical_fiscal_profile
+from app.services.tax_nature import (
+    persistable_nature,
+    signals_from_nature,
+    apply_tax_nature,
+    normalize_operation_type,
+    normalize_withholding_type,
+)
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -80,52 +88,14 @@ SIGNAL_KEYWORD_MAP: Dict[str, List[str]] = {
 
 def _extract_signals(entry: dict) -> Dict[str, bool]:
     """
-    Extract boolean financial/semantic signals from a ledger entry.
-    These signals are matched against modelo names to determine attribution.
+    Legal signals from stored tax nature + amounts.
+    Invoice description is not used once operation_type / withholding_type exist.
     """
     invoice_data = entry.get("invoice_data") or {}
-    totals       = invoice_data.get("totals") or {}
-    ocr_text     = (entry.get("ocr_text") or "").lower()
-    tx_type      = str(invoice_data.get("transaction_type", "")).lower()
-
-    vat_amount = float(totals.get("VAT_amount") or 0)
-    vat_rate   = float(totals.get("VAT_rate") or 0)
-    raw_total  = float(totals.get("total") or 0)
-
-    # ── has_vat: three ways to confirm VAT is present ────────────────────────
-    # 1. VAT_amount is a real monetary value (not the rate stored as amount)
-    monetary_vat = vat_amount > 0 and vat_amount != vat_rate
-    # 2. OCR bug: VAT_amount == VAT_rate but the invoice text mentions IVA/VAT
-    #    (e.g. "VAT (21%): €210.00" in ocr_text even though totals.VAT_amount=21)
-    ocr_mentions_vat = bool(re.search(
-        r"\b(iva|vat|igic|impuesto\s+valor)\b", ocr_text, re.IGNORECASE
-    ))
-    # 3. Total_with_Tax > total (implies VAT was added)
-    total_with_tax = float(totals.get("Total_with_Tax") or 0)
-    implicit_vat   = total_with_tax > raw_total > 0
-
-    has_vat = monetary_vat or ocr_mentions_vat or implicit_vat
-
-    has_irpf = bool(re.search(
-        r"retenci[oó]n|irpf|pago\s+fraccionado", ocr_text, re.IGNORECASE
-    ))
-    is_rent = bool(re.search(
-        r"alquiler|arrendamiento|rent\b|inmueble", ocr_text, re.IGNORECASE
-    ))
-    is_professional = bool(re.search(
-        r"honorarios|servicios?\s+profesionales?|prestaci[oó]n\s+de\s+servicios?"
-        r"|freelance|software\s+development|consulting",
-        ocr_text, re.IGNORECASE
-    ))
-
-    return {
-        "has_vat":         has_vat,
-        "has_irpf":        has_irpf,
-        "is_rent":         is_rent,
-        "is_professional": is_professional,
-        "is_income":       tx_type in ("income", "credit"),
-        "is_expense":      tx_type in ("expense", "debit"),
-    }
+    ocr_text = entry.get("ocr_text") or ""
+    invoice_data, nature = persistable_nature(invoice_data, ocr_text=ocr_text)
+    entry["invoice_data"] = invoice_data
+    return signals_from_nature(invoice_data, nature)
 
 
 def _modelo_matches_signals(
@@ -183,13 +153,7 @@ class TaxClassificationService:
             raise ValueError(f"Ledger entry {ledger_id} not found")
 
         classification = self._classify(entry, user_id)
-        self._ledger.update_one(
-            {"_id": ObjectId(ledger_id)},
-            {"$set": {
-                "tax_classification": classification,
-                "tax_classified_at": datetime.utcnow(),
-            }}
-        )
+        self._persist_classification(entry["_id"], entry.get("invoice_data") or {}, classification)
         logger.info(
             f"[ClassificationLayer] entry={ledger_id} "
             f"modelos={[m['modelo_no'] for m in classification['matched_modelos']]}"
@@ -217,12 +181,8 @@ class TaxClassificationService:
             stats["processed"] += 1
             try:
                 classification = self._classify(entry, user_id)
-                self._ledger.update_one(
-                    {"_id": entry["_id"]},
-                    {"$set": {
-                        "tax_classification": classification,
-                        "tax_classified_at": datetime.utcnow(),
-                    }}
+                self._persist_classification(
+                    entry["_id"], entry.get("invoice_data") or {}, classification
                 )
                 if classification["matched_modelos"]:
                     stats["classified"] += 1
@@ -255,24 +215,142 @@ class TaxClassificationService:
             return self._empty_result("No matching modelos found in modelos collection")
 
         signals = _extract_signals(entry)
-        matched = []
+        auto_matched = []
 
         for modelo in modelos:
             explanation = _modelo_matches_signals(modelo["name"], signals)
             if explanation:
-                matched.append({
+                auto_matched.append({
                     "modelo_id":  str(modelo["_id"]),
                     "modelo_no":  modelo["modelo_no"],
                     "modelo_name": modelo["name"],
                     "explanation": explanation,
                 })
 
+        existing = entry.get("tax_classification") or {}
+        override = existing.get("user_override")
+        if override and existing.get("matched_modelos"):
+            matched = existing["matched_modelos"]
+        else:
+            matched = auto_matched
+            override = False
+
         return {
             "modelo_ids":      [m["modelo_id"] for m in matched],
             "matched_modelos": matched,
+            "auto_matched_modelos": auto_matched,
             "signals":         signals,
+            "user_override":   bool(override),
             "classified_at":   datetime.utcnow().isoformat(),
         }
+
+    def override_classification(
+        self,
+        ledger_id: str,
+        user_id: str,
+        *,
+        modelo_nos: Optional[List[str]] = None,
+        operation_type: Optional[str] = None,
+        withholding_type: Optional[str] = None,
+        clear_override: bool = False,
+    ) -> dict:
+        """Update tax nature and/or lock which modelos this entry belongs to."""
+        entry = self._ledger.find_one({"_id": ObjectId(ledger_id)})
+        if not entry:
+            raise ValueError(f"Ledger entry {ledger_id} not found")
+
+        invoice_data = dict(entry.get("invoice_data") or {})
+        nature_changed = False
+        if operation_type is not None:
+            normalized = normalize_operation_type(operation_type)
+            if not normalized:
+                raise ValueError(f"Invalid operation_type: {operation_type}")
+            invoice_data = apply_tax_nature(
+                invoice_data,
+                {
+                    "operation_type": normalized,
+                    "withholding_type": normalize_withholding_type(
+                        invoice_data.get("withholding_type")
+                    ) or "none",
+                },
+            )
+            nature_changed = True
+        if withholding_type is not None:
+            normalized = normalize_withholding_type(withholding_type)
+            if not normalized:
+                raise ValueError(f"Invalid withholding_type: {withholding_type}")
+            invoice_data = apply_tax_nature(
+                invoice_data,
+                {
+                    "operation_type": normalize_operation_type(
+                        invoice_data.get("operation_type")
+                    ) or "general",
+                    "withholding_type": normalized,
+                },
+            )
+            nature_changed = True
+
+        if nature_changed:
+            entry["invoice_data"] = invoice_data
+            if modelo_nos is None:
+                existing = dict(entry.get("tax_classification") or {})
+                existing.pop("user_override", None)
+                entry["tax_classification"] = existing
+
+        if clear_override:
+            existing = dict(entry.get("tax_classification") or {})
+            existing.pop("user_override", None)
+            entry["tax_classification"] = existing
+
+        if modelo_nos is not None:
+            applicable_nos = set(self._get_user_applicable_modelo_nos(user_id))
+            wanted = [str(no) for no in modelo_nos if str(no)]
+            invalid = [no for no in wanted if no not in applicable_nos]
+            if invalid:
+                raise ValueError(
+                    f"Modelo(s) not applicable for this user: {', '.join(invalid)}"
+                )
+            modelos = self._load_modelos_by_nos(wanted)
+            by_no = {m["modelo_no"]: m for m in modelos}
+            matched = []
+            for no in wanted:
+                modelo = by_no.get(no)
+                if not modelo:
+                    raise ValueError(f"Modelo {no} not found")
+                matched.append({
+                    "modelo_id": str(modelo["_id"]),
+                    "modelo_no": modelo["modelo_no"],
+                    "modelo_name": modelo["name"],
+                    "explanation": "User override",
+                })
+            signals = _extract_signals(entry)
+            classification = {
+                "modelo_ids": [m["modelo_id"] for m in matched],
+                "matched_modelos": matched,
+                "auto_matched_modelos": [],
+                "signals": signals,
+                "user_override": True,
+                "overridden_at": datetime.utcnow().isoformat(),
+                "classified_at": datetime.utcnow().isoformat(),
+            }
+            self._persist_classification(entry["_id"], entry.get("invoice_data") or {}, classification)
+            return classification
+
+        classification = self._classify(entry, user_id)
+        self._persist_classification(entry["_id"], entry.get("invoice_data") or {}, classification)
+        return classification
+
+    def _persist_classification(
+        self, ledger_oid, invoice_data: dict, classification: dict
+    ) -> None:
+        self._ledger.update_one(
+            {"_id": ledger_oid},
+            {"$set": {
+                "invoice_data": invoice_data,
+                "tax_classification": classification,
+                "tax_classified_at": datetime.utcnow(),
+            }}
+        )
 
     def _get_user_applicable_modelo_nos(self, user_id: str) -> List[str]:
         """

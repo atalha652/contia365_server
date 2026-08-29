@@ -14,6 +14,8 @@ from app.models.tax_models import (
     VATType, IRPFType, TaxPeriod, VATSummary, IRPFSummary,
     TaxTransaction, ModeloCalculation
 )
+from app.services.fiscal_profile_service import get_canonical_fiscal_profile
+from app.services.irpf_130 import modelo_130_payable, resolve_modelo_130_rate_percent
 
 logger = logging.getLogger(__name__)
 
@@ -181,94 +183,118 @@ class TaxCalculationService:
             logger.error(f"Error calculating VAT summary: {e}")
             raise
     
+    def _sum_irpf_base(
+        self,
+        organization_id: str,
+        irpf_type: str,
+        start_dt: datetime,
+        end_dt: datetime,
+        *,
+        end_exclusive: bool = False,
+    ) -> Decimal:
+        end_op = "$lt" if end_exclusive else "$lte"
+        result = list(self.tax_transactions.aggregate([
+            {
+                "$match": {
+                    "organization_id": organization_id,
+                    "irpf_type": irpf_type,
+                    "transaction_date": {"$gte": start_dt, end_op: end_dt},
+                }
+            },
+            {"$group": {"_id": None, "total": {"$sum": "$irpf_base"}}},
+        ]))
+        return Decimal(str(result[0]["total"])) if result else Decimal("0")
+
+    def _prior_130_payments(
+        self,
+        user_id: str,
+        organization_id: str,
+        year: int,
+        quarter: int,
+    ) -> Decimal:
+        """Sum earlier 130 irpf_payable amounts already stored this year."""
+        if quarter <= 1:
+            return Decimal("0")
+        ids = {str(user_id), str(organization_id)}
+        prior = Decimal("0")
+        for report in self.db["tax_reports"].find({
+            "modelo": "130",
+            "year": year,
+            "user_id": {"$in": list(ids)},
+        }):
+            report_q = str(report.get("quarter") or "")
+            qn = 0
+            if report_q.startswith("Q") and report_q[1:].isdigit():
+                qn = int(report_q[1:])
+            elif report_q.isdigit():
+                qn = int(report_q)
+            if 1 <= qn < quarter:
+                prior += Decimal(str((report.get("results") or {}).get("irpf_payable") or 0))
+        return prior.quantize(Decimal("0.01"))
+
     def calculate_irpf_summary(
         self,
         organization_id: str,
         start_date: date,
         end_date: date,
         quarter: int,
-        irpf_rate: Decimal = Decimal("20")
+        irpf_rate: Optional[Decimal] = None,
+        user_id: Optional[str] = None,
     ) -> IRPFSummary:
         """
-        Calculate IRPF summary for a quarter (Modelo 130)
-        Net Income = Gross Income - Deductible Expenses
-        IRPF Payable = Net Income * IRPF Rate
+        Modelo 130 for a quarter using year-to-date income/expenses.
+        IRPF to pay = max(0, YTD net × régimen rate − prior 130 payments)
         """
         try:
-            start_dt = datetime.combine(start_date, datetime.min.time())
-            end_dt = datetime.combine(end_date, datetime.max.time())
-            
-            # Aggregate income
-            income_pipeline = [
-                {
-                    "$match": {
-                        "organization_id": organization_id,
-                        "irpf_type": IRPFType.INCOME.value,
-                        "transaction_date": {"$gte": start_dt, "$lte": end_dt}
-                    }
-                },
-                {
-                    "$group": {
-                        "_id": None,
-                        "total_income": {"$sum": "$irpf_base"}
-                    }
-                }
-            ]
-            
-            income_result = list(self.tax_transactions.aggregate(income_pipeline))
-            gross_income = Decimal(str(income_result[0]["total_income"])) if income_result else Decimal("0")
-            
-            # Aggregate deductible expenses
-            expense_pipeline = [
-                {
-                    "$match": {
-                        "organization_id": organization_id,
-                        "irpf_type": IRPFType.EXPENSE.value,
-                        "transaction_date": {"$gte": start_dt, "$lte": end_dt}
-                    }
-                },
-                {
-                    "$group": {
-                        "_id": None,
-                        "total_expenses": {"$sum": "$irpf_base"}
-                    }
-                }
-            ]
-            
-            expense_result = list(self.tax_transactions.aggregate(expense_pipeline))
-            deductible_expenses = Decimal(str(expense_result[0]["total_expenses"])) if expense_result else Decimal("0")
-            
-            # Calculate net income and IRPF
-            net_income = gross_income - deductible_expenses
-            irpf_payable = (net_income * irpf_rate / Decimal("100")).quantize(Decimal("0.01"))
-            
-            # Get previous quarters data (for cumulative calculation)
+            profile_id = user_id or organization_id
+            try:
+                profile = get_canonical_fiscal_profile(
+                    self.db["users"], self.db["census_data"], profile_id
+                )
+            except Exception:
+                profile = None
+            if irpf_rate is None:
+                irpf_rate = Decimal(str(resolve_modelo_130_rate_percent(profile, start_date.year)))
+
             year_start = date(start_date.year, 1, 1)
-            previous_quarter_end = start_date
-            
+            ytd_start = datetime.combine(year_start, datetime.min.time())
+            end_dt = datetime.combine(end_date, datetime.max.time())
+
+            gross_income = self._sum_irpf_base(
+                organization_id, IRPFType.INCOME.value, ytd_start, end_dt
+            )
+            deductible_expenses = self._sum_irpf_base(
+                organization_id, IRPFType.EXPENSE.value, ytd_start, end_dt
+            )
+            net_income = gross_income - deductible_expenses
+
             previous_income = Decimal("0")
-            previous_irpf = Decimal("0")
-            
+            previous_irpf = self._prior_130_payments(
+                profile_id, organization_id, start_date.year, quarter
+            )
             if quarter > 1:
-                prev_start_dt = datetime.combine(year_start, datetime.min.time())
-                prev_end_dt = datetime.combine(previous_quarter_end, datetime.max.time())
-                
-                prev_income_result = list(self.tax_transactions.aggregate([
-                    {
-                        "$match": {
-                            "organization_id": organization_id,
-                            "irpf_type": IRPFType.INCOME.value,
-                            "transaction_date": {"$gte": prev_start_dt, "$lt": prev_end_dt}
-                        }
-                    },
-                    {"$group": {"_id": None, "total": {"$sum": "$irpf_base"}}}
-                ]))
-                
-                if prev_income_result:
-                    previous_income = Decimal(str(prev_income_result[0]["total"]))
-            
-            irpf_to_pay = irpf_payable - previous_irpf
-            
+                prev_end_dt = datetime.combine(start_date, datetime.min.time())
+                previous_income = self._sum_irpf_base(
+                    organization_id, IRPFType.INCOME.value, ytd_start, prev_end_dt,
+                    end_exclusive=True,
+                )
+                if previous_irpf == 0:
+                    prev_expenses = self._sum_irpf_base(
+                        organization_id, IRPFType.EXPENSE.value, ytd_start, prev_end_dt,
+                        end_exclusive=True,
+                    )
+                    prev_net = previous_income - prev_expenses
+                    previous_irpf = Decimal(str(modelo_130_payable(
+                        float(prev_net), float(irpf_rate) / 100.0
+                    ))).quantize(Decimal("0.01"))
+
+            irpf_to_pay = Decimal(str(modelo_130_payable(
+                float(net_income),
+                float(irpf_rate) / 100.0,
+                0.0,
+                float(previous_irpf),
+            ))).quantize(Decimal("0.01"))
+
             summary = IRPFSummary(
                 period_start=start_date,
                 period_end=end_date,
@@ -277,15 +303,15 @@ class TaxCalculationService:
                 deductible_expenses=deductible_expenses,
                 net_income=net_income,
                 irpf_rate=irpf_rate,
-                irpf_payable=irpf_payable,
+                irpf_payable=irpf_to_pay,
                 previous_quarters_income=previous_income,
                 previous_quarters_irpf=previous_irpf,
-                irpf_to_pay=irpf_to_pay
+                irpf_to_pay=irpf_to_pay,
             )
-            
+
             logger.info(f"IRPF summary calculated: {irpf_to_pay} to pay for Q{quarter}")
             return summary
-            
+
         except Exception as e:
             logger.error(f"Error calculating IRPF summary: {e}")
             raise
@@ -362,6 +388,20 @@ class TaxCalculationService:
             
             # Only create if tax-relevant
             if tax_transaction.get("vat_type") or tax_transaction.get("irpf_type"):
+                existing_tx = self.tax_transactions.find_one({"ledger_entry_id": ledger_entry_id})
+                if existing_tx:
+                    update_fields = {
+                        key: value for key, value in tax_transaction.items() if key != "created_at"
+                    }
+                    update_fields["updated_at"] = datetime.utcnow()
+                    self.tax_transactions.update_one(
+                        {"_id": existing_tx["_id"]},
+                        {"$set": update_fields},
+                    )
+                    logger.info(
+                        f"Updated tax transaction {existing_tx['_id']} from ledger entry {ledger_entry_id}"
+                    )
+                    return str(existing_tx["_id"])
                 result = self.tax_transactions.insert_one(tax_transaction)
                 logger.info(f"Created tax transaction {result.inserted_id} from ledger entry {ledger_entry_id}")
                 return str(result.inserted_id)

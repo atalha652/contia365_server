@@ -60,38 +60,21 @@ Financial overview with three key widgets:
 
 ---
 
-### Vouchers (`/app/vouchers`)
-Where raw financial documents enter the system. Two tabs:
+### Expenses (`/app/expenses/uploads`)
+Where raw financial documents enter the system.
 
-**Uploads tab:**
-1. Click Upload or the upload area
-2. Modal opens — fill in: Title, Description, Category (supplies/services/rent/etc.), Tax Period (e.g. 2026-04), Transaction Type (Credit = income / Debit = expense), Files (PDF or image)
-3. Click Upload → saved to backend
-4. Voucher goes into the approval queue
+**Uploads:**
+1. Click **Upload Expense** — fill in: Title, Description, Category, Tax Period (e.g. 2026-04), Transaction Type (Credit = income / Debit = expense), Files (PDF or image)
+2. Click Upload → voucher saved with OCR = pending
+3. Click **Run OCR** on that row (or **Run OCR Selected**) → extracts supplier, line items, VAT, IRPF
+4. When OCR completes successfully, the voucher is **auto-approved** — no separate approval step
+5. Click **Create Invoice** on approved rows to open a pre-filled draft
+6. Typed **Add Expense** skips OCR (no file) and creates a draft invoice immediately
 
 **Gmail tab:**
 1. Click "Connect Gmail" → Google OAuth flow
 2. After connecting, purchase emails are fetched automatically
 3. Select emails → click "Convert to Vouchers" → emails become voucher records
-
----
-
-### Requests (`/app/requests`)
-Approval workflow for vouchers.
-- Lists vouchers pending approval with their status
-- As approver: click **Approve** → moves to approved status
-- Click **Reject** → reason field appears → type reason → confirm
-- Approved vouchers become available for OCR and invoice creation
-- Click the ℹ️ info icon on any row → right-side panel shows full rejection history
-
----
-
-### Execution (`/app/execution`)
-Where accounting actions are triggered.
-1. Select approved vouchers from the list
-2. Click **Run OCR** → backend reads the document, extracts: supplier, customer, line items, VAT, IRPF
-3. After OCR completes → click **Create Invoice** → draft invoice created pre-filled with OCR data
-4. Or click **Send for Approval** to push vouchers back into the Requests queue
 
 ---
 

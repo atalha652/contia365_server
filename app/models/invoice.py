@@ -80,6 +80,7 @@ class Invoice(BaseModel):
     source_voucher_id: str
     ocr_ledger_id: Optional[str] = None        # _id of the source ledger/OCR record
     ocr_source: bool = False                    # True when auto-filled from OCR data
+    source: Optional[str] = None                # "manual" when typed; "ocr" when scanned
     invoice_type: InvoiceType = InvoiceType.INCOME
     status: InvoiceStatus = InvoiceStatus.DRAFT
     series: str = "A"
@@ -87,6 +88,8 @@ class Invoice(BaseModel):
     customer: CustomerInfo
     lines: List[InvoiceLineItem]
     totals: InvoiceTotals
+    operation_type: str = "general"
+    withholding_type: str = "none"
     ledger_entry_id: Optional[str] = None
     # VeriFactu hash chain fields
     fingerprint: Optional[str] = None
@@ -123,6 +126,28 @@ class InvoiceUpdate(BaseModel):
     series: Optional[str] = None
     customer: Optional[CustomerInfo] = None
     lines: Optional[List[InvoiceLineItem]] = None
+    operation_type: Optional[str] = None
+    withholding_type: Optional[str] = None
+
+    @validator("operation_type")
+    def _operation_type(cls, value):
+        if value is None:
+            return value
+        from app.services.tax_nature import normalize_operation_type
+        normalized = normalize_operation_type(value)
+        if not normalized:
+            raise ValueError("Invalid operation_type")
+        return normalized
+
+    @validator("withholding_type")
+    def _withholding_type(cls, value):
+        if value is None:
+            return value
+        from app.services.tax_nature import normalize_withholding_type
+        normalized = normalize_withholding_type(value)
+        if not normalized:
+            raise ValueError("Invalid withholding_type")
+        return normalized
 
     model_config = ConfigDict(
         json_encoders={Decimal: float},

@@ -180,6 +180,27 @@ def extract_invoice_data_enhanced(text: str, voucher_id: str = None, file_index:
         if irpf_amt_m:
             irpf_amount = parse_amount(irpf_amt_m.group(1))
 
+    recargo_rate_m = re.search(
+        r"recargo(?:\s+de)?\s+equivalencia[^\d]*(\d{1,2}(?:[.,]\d+)?)\s*%",
+        t, re.IGNORECASE,
+    ) or re.search(r"recargo[^\d]*(\d{1,2}(?:[.,]\d+)?)\s*%", t, re.IGNORECASE)
+    recargo_rate = float(recargo_rate_m.group(1).replace(",", ".")) if recargo_rate_m else 0.0
+    recargo_amount = 0.0
+    if recargo_rate_m:
+        after_re = t[recargo_rate_m.end():]
+        recargo_amt_m = re.search(r"[^\d]*(\d[\d,\.]+)", after_re)
+        if recargo_amt_m:
+            recargo_amount = parse_amount(recargo_amt_m.group(1))
+    vat_regime = ""
+    if re.search(r"inversi[oó]n\s+del\s+sujeto\s+pasivo|\bisp\b|reverse\s+charge", t, re.I):
+        vat_regime = "isp"
+    elif re.search(r"intracomunitar|intra-community", t, re.I):
+        vat_regime = "intra"
+    elif re.search(r"recargo\s+de\s+equivalencia", t, re.I):
+        vat_regime = "recargo"
+    elif re.search(r"bienes\s+usados|\brebu\b", t, re.I):
+        vat_regime = "used_goods"
+
     # total_with_tax = whatever the invoice says is the final amount — no recalculation
     total_with_tax = total
 
@@ -208,7 +229,7 @@ def extract_invoice_data_enhanced(text: str, voucher_id: str = None, file_index:
         else [{"description": "See document", "qty": 1, "unit_price": total, "subtotal": total}]
     )
 
-    return {
+    result = {
         "transaction_type": transaction_type,
         "supplier": {
             "business_name": supplier_name,
@@ -236,6 +257,13 @@ def extract_invoice_data_enhanced(text: str, voucher_id: str = None, file_index:
             "VAT_amount": round(vat_amount, 2),
             "IRPF_rate": irpf_rate,
             "IRPF_amount": round(irpf_amount, 2),
+            "recargo_rate": recargo_rate,
+            "recargo_amount": round(recargo_amount, 2),
+            "vat_regime": vat_regime,
             "Total_with_Tax": round(total_with_tax, 2)
         },
     }
+
+    from app.services.tax_nature import persistable_nature
+    seeded, _ = persistable_nature(result, ocr_text=t)
+    return seeded

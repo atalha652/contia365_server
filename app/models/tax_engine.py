@@ -37,13 +37,32 @@ class VatByRateBucket(BaseModel):
     input_vat: float = 0.0
 
 
+class RecargoBucket(BaseModel):
+    base: float = 0.0
+    vat: float = 0.0
+
+
 class Modelo303Results(BaseModel):
-    total_sales: float = 0.0          # Base imponible ventas
-    total_expenses: float = 0.0       # Base imponible compras
-    output_vat: float = 0.0           # IVA repercutido (on sales)
-    input_vat: float = 0.0            # IVA soportado (on purchases)
-    vat_payable: float = 0.0          # output_vat - input_vat (positive = pay, negative = refund)
+    total_sales: float = 0.0          # Base imponible ventas (régimen general)
+    total_expenses: float = 0.0       # Base imponible compras (régimen general)
+    output_vat: float = 0.0           # IVA repercutido RG (on sales)
+    input_vat: float = 0.0            # IVA soportado RG (on purchases)
+    vat_payable: float = 0.0          # casilla 46 = [27] − [45]
     vat_by_rate: Dict[str, VatByRateBucket] = Field(default_factory=dict)
+    isp_base: float = 0.0             # casilla 12
+    isp_vat: float = 0.0              # casilla 13
+    intra_base: float = 0.0           # casilla 10
+    intra_vat: float = 0.0            # casilla 11
+    import_base: float = 0.0          # casilla 32
+    import_vat: float = 0.0           # casilla 33
+    investment_base: float = 0.0      # casilla 30
+    investment_vat: float = 0.0       # casilla 31
+    recargo_by_rate: Dict[str, RecargoBucket] = Field(default_factory=dict)
+    recargo_vat: float = 0.0
+    used_goods_base: float = 0.0
+    prorrata_percent: float = 100.0
+    prorrata_especial: bool = False
+    input_vat_deductible: float = 0.0  # casilla 45 after prorrata
 
 
 # ─────────────────────── Modelo 130 (IRPF) ──────────────────────────────────
@@ -52,10 +71,10 @@ class Modelo130Results(BaseModel):
     total_income: float = 0.0         # Total ingresos del trimestre
     total_expenses: float = 0.0       # Total gastos deducibles del trimestre
     taxable_income: float = 0.0       # total_income - total_expenses
-    irpf_rate: float = 0.20           # 20% fixed rate
+    irpf_rate: float = 0.20           # 0.20 estimación directa; 0.07 starters (from régimen)
     irpf_already_withheld: float = 0.0  # Retenciones a cuenta ya practicadas (from OCR only)
     prior_payments: float = 0.0       # Casilla 05 — 130 payments already made this year
-    irpf_payable: float = 0.0         # max(0, taxable_income * rate - already_withheld)
+    irpf_payable: float = 0.0         # max(0, YTD profit × rate − withheld − prior_payments)
 
 
 # ─────────────────────── Generic Tax Report ─────────────────────────────────
@@ -137,8 +156,8 @@ class TaxReportUpdateStatus(BaseModel):
 
 class Modelo115Results(BaseModel):
     total_rent_base: float = 0.0        # Base imponible alquileres
-    retention_rate: float = 0.19        # 19% standard retention on rent
-    withholding_payable: float = 0.0    # total_rent_base × retention_rate
+    retention_rate: float = 0.0         # effective withheld / base (0 if invoice has no IRPF)
+    withholding_payable: float = 0.0    # sum of IRPF printed on rent invoices (never invented)
     percipient_count: int = 0
 
 
@@ -182,9 +201,24 @@ class Modelo390Results(BaseModel):
     total_expenses: float = 0.0
     output_vat: float = 0.0
     input_vat: float = 0.0
-    net_vat: float = 0.0                # output - input (annual)
+    net_vat: float = 0.0                # annual casilla-style [27] − [45]
     quarterly_payments: float = 0.0     # Sum of 303 payments already made
     vat_by_rate: Dict[str, VatByRateBucket] = Field(default_factory=dict)
+    isp_base: float = 0.0
+    isp_vat: float = 0.0
+    intra_base: float = 0.0
+    intra_vat: float = 0.0
+    import_base: float = 0.0
+    import_vat: float = 0.0
+    investment_base: float = 0.0
+    investment_vat: float = 0.0
+    recargo_by_rate: Dict[str, RecargoBucket] = Field(default_factory=dict)
+    recargo_vat: float = 0.0
+    used_goods_base: float = 0.0
+    prorrata_percent: float = 100.0
+    prorrata_especial: bool = False
+    regimen_simplificado: bool = False
+    input_vat_deductible: float = 0.0
 
 
 class Modelo390Response(BaseModel):

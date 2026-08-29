@@ -7,6 +7,7 @@ from app.services.user_type_vocab import canonicalize_user_type
 
 ADMIN_PAGE_SIZE = 10
 ADMIN_PAGES = [
+    {"id": "dashboard", "label": "Dashboard", "path": "/admin/dashboard"},
     {"id": "users", "label": "Users", "path": "/admin/users"},
     {"id": "sales", "label": "Sales", "path": "/admin/sales"},
 ]

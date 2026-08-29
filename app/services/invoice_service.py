@@ -32,6 +32,7 @@ from app.models.invoice import (
     CustomerInfo,
 )
 from app.repos.invoice_repository import InvoiceRepository
+from app.services.manual_voucher import is_manual_voucher
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -386,6 +387,8 @@ class InvoiceService:
             "transaction_type": tx_type,
             "customer": customer,
             "lines": lines,
+            "operation_type": inv_data.get("operation_type") or "general",
+            "withholding_type": inv_data.get("withholding_type") or "none",
         }
 
     # ==================== PUBLIC API ====================
@@ -427,9 +430,14 @@ class InvoiceService:
                 f"Use POST /api/accounting/voucher/approve to approve it first."
             )
 
-        # ── Step 1: Try OCR data first ────────────────────────────────────────
+        # ── Step 1: Try OCR / ledger data first ───────────────────────────────
         ocr_data = self._extract_from_ocr(voucher_id, user_id=organization_id)
-        ocr_source = ocr_data is not None and not ocr_data.get("indirect", False)
+        manual = is_manual_voucher(voucher)
+        ocr_source = (
+            ocr_data is not None
+            and not ocr_data.get("indirect", False)
+            and not manual
+        )
         ocr_ledger_id = ocr_data.get("ocr_ledger_id") if ocr_data else None
 
         # ── Step 2: Determine invoice_type ───────────────────────────────────
@@ -508,12 +516,15 @@ class InvoiceService:
             source_voucher_id=voucher_id,
             ocr_ledger_id=ocr_ledger_id,
             ocr_source=ocr_source,
+            source="manual" if manual else ("ocr" if ocr_source else None),
             invoice_type=invoice_type,
             status=InvoiceStatus.DRAFT,
             series=voucher.get("invoice_series", "A"),
             customer=customer,
             lines=lines,
             totals=totals,
+            operation_type=(ocr_data or {}).get("operation_type") or "general",
+            withholding_type=(ocr_data or {}).get("withholding_type") or "none",
         )
 
         created = self.repo.create(invoice)
@@ -626,6 +637,11 @@ class InvoiceService:
         if data.customer is not None:
             fields["customer"] = self._decimals_to_float(data.customer.dict())
 
+        if data.operation_type is not None:
+            fields["operation_type"] = data.operation_type
+        if data.withholding_type is not None:
+            fields["withholding_type"] = data.withholding_type
+
         if data.lines is not None:
             effective_type = data.invoice_type or invoice.invoice_type
             lines = self._recalculate_lines(data.lines)
@@ -651,7 +667,33 @@ class InvoiceService:
             raise ValueError(
                 "Update failed — invoice may no longer be in DRAFT status"
             )
+        self._sync_tax_nature_to_ledger(updated)
         return updated
+
+    def _sync_tax_nature_to_ledger(self, invoice: Invoice) -> None:
+        """Keep the OCR ledger tax nature in sync so tax filing uses the same fields."""
+        ledger_id = invoice.ocr_ledger_id
+        if not ledger_id or not ObjectId.is_valid(str(ledger_id)):
+            return
+        entry = self.ocr_ledger.find_one({"_id": ObjectId(str(ledger_id))})
+        if not entry:
+            return
+        invoice_data = dict(entry.get("invoice_data") or {})
+        invoice_data["operation_type"] = invoice.operation_type or "general"
+        invoice_data["withholding_type"] = invoice.withholding_type or "none"
+        totals = dict(invoice_data.get("totals") or {})
+        totals["vat_regime"] = invoice.operation_type or "general"
+        invoice_data["totals"] = totals
+        self.ocr_ledger.update_one(
+            {"_id": ObjectId(str(ledger_id))},
+            {"$set": {"invoice_data": invoice_data, "updated_at": datetime.utcnow()}},
+        )
+        user_id = str(entry.get("user_id") or invoice.organization_id)
+        try:
+            from app.services.tax_classification_service import TaxClassificationService
+            TaxClassificationService().classify_ledger_entry(str(ledger_id), user_id)
+        except Exception as exc:
+            logger.warning("[Invoice] tax reclassify after draft save failed: %s", exc)
 
     def refresh_ocr(self, organization_id: str, invoice_id: str) -> Invoice:
         """
@@ -669,6 +711,11 @@ class InvoiceService:
             raise ValueError(
                 f"Only DRAFT invoices can be refreshed (current status: {invoice.status})"
             )
+        if invoice.source == "manual" or is_manual_voucher(
+            self.vouchers.find_one({"_id": ObjectId(invoice.source_voucher_id)})
+            if ObjectId.is_valid(invoice.source_voucher_id) else None
+        ):
+            raise ValueError("This invoice was entered by hand. OCR is not used.")
 
         ocr_data = self._extract_from_ocr(
             invoice.source_voucher_id,
@@ -690,6 +737,8 @@ class InvoiceService:
             "invoice_type": invoice_type.value,
             "ocr_source": not ocr_data.get("indirect", False),
             "ocr_ledger_id": ocr_data["ocr_ledger_id"],
+            "operation_type": ocr_data.get("operation_type") or "general",
+            "withholding_type": ocr_data.get("withholding_type") or "none",
             "customer": self._decimals_to_float(customer.dict()),
             "lines": self._decimals_to_float([l.dict() for l in lines]),
             "totals.subtotal":       float(totals.subtotal),

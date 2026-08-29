@@ -5,7 +5,8 @@ AEAT publishes a fixed-width BOE / .303 layout — not Facturae XML.
 Casilla numbers and field positions come from DR303e26v101.xlsx
 (DP30300 wrapper + DP30301 régimen general page).
 
-Recargo de equivalencia, ISP and OSS are left empty (out of scope).
+Recargo, ISP, intra-community, imports and prorrata are filled when the engine
+provides amounts; unused official casillas stay zero.
 """
 
 from __future__ import annotations
@@ -153,7 +154,7 @@ def build_page_01(
     _put(buf, 112, "2")  # conjunta
     _put(buf, 113, "2")  # criterio de caja
     _put(buf, 114, "2")  # destinatario caja
-    _put(buf, 115, "2")  # prorrata especial
+    _put(buf, 115, "1" if getattr(totals, "prorrata_especial", False) else "2")
     _put(buf, 116, "2")  # revocación prorrata
     _put(buf, 117, "2")  # concurso
     _put(buf, 118, " " * 8)  # bankruptcy date
@@ -192,6 +193,48 @@ def build_page_01(
     _put(buf, 326, _num(b21.output_base, 17))
     _put(buf, 348, _num(b21.output_vat, 17))
 
+    intra_base = float(getattr(totals, "intra_base", 0) or 0)
+    intra_vat = float(getattr(totals, "intra_vat", 0) or 0)
+    isp_base = float(getattr(totals, "isp_base", 0) or 0)
+    isp_vat = float(getattr(totals, "isp_vat", 0) or 0)
+    import_base = float(getattr(totals, "import_base", 0) or 0)
+    import_vat = float(getattr(totals, "import_vat", 0) or 0)
+    investment_base = float(getattr(totals, "investment_base", 0) or 0)
+    investment_vat = float(getattr(totals, "investment_vat", 0) or 0)
+    _put(buf, 365, _num(intra_base, 17))  # [10]
+    _put(buf, 382, _num(intra_vat, 17))  # [11]
+    _put(buf, 399, _num(isp_base, 17))  # [12]
+    _put(buf, 416, _num(isp_vat, 17))  # [13]
+
+    recargo_map = {
+        "1.75": (467, 484, 489, "00175"),
+        "1.750": (467, 484, 489, "00175"),
+        "5.2": (545, 562, 567, "00520"),
+        "5.20": (545, 562, 567, "00520"),
+        "1.4": (584, 601, 606, "00140"),
+        "1.40": (584, 601, 606, "00140"),
+        "0.5": (623, 640, 645, "00050"),
+        "0.50": (623, 640, 645, "00050"),
+    }
+    recargo_vat_total = 0.0
+    for rate_key, bucket in (getattr(totals, "recargo_by_rate", None) or {}).items():
+        slot = recargo_map.get(str(rate_key))
+        if not slot:
+            continue
+        base_pos, tipo_pos, vat_pos, tipo = slot
+        if isinstance(bucket, Mapping):
+            r_base = float(bucket.get("base") or 0)
+            r_vat = float(bucket.get("vat") or 0)
+        else:
+            r_base = float(getattr(bucket, "base", 0) or 0)
+            r_vat = float(getattr(bucket, "vat", 0) or 0)
+        recargo_vat_total += r_vat
+        _put(buf, base_pos, _num(r_base, 17))
+        _put(buf, tipo_pos, tipo)
+        _put(buf, vat_pos, _num(r_vat, 17))
+    if recargo_vat_total == 0:
+        recargo_vat_total = float(getattr(totals, "recargo_vat", 0) or 0)
+
     output_vat = round(
         b0.output_vat + b4.output_vat + b10.output_vat + b21.output_vat,
         2,
@@ -200,22 +243,44 @@ def build_page_01(
         output_vat = round(float(totals.output_vat or 0), 2)
 
     input_base = round(
-        b0.input_base + b4.input_base + b10.input_base + b21.input_base,
+        b0.input_base + b4.input_base + b10.input_base + b21.input_base + isp_base,
         2,
     )
     input_vat = round(
-        b0.input_vat + b4.input_vat + b10.input_vat + b21.input_vat,
+        b0.input_vat + b4.input_vat + b10.input_vat + b21.input_vat + isp_vat,
         2,
     )
-    if input_vat == 0:
+    if input_vat == 0 and isp_vat == 0:
         input_vat = round(float(totals.input_vat or 0), 2)
         input_base = round(float(totals.total_expenses or input_base), 2)
 
-    _put(buf, 696, _signed(output_vat, 17))  # [27]
+    prorrata = float(getattr(totals, "prorrata_percent", 100) or 100)
+    factor = max(0.0, min(100.0, prorrata)) / 100.0
+    input_base = round(input_base * factor, 2)
+    input_vat = round(input_vat * factor, 2)
+    intra_base_d = round(intra_base * factor, 2)
+    intra_vat_d = round(intra_vat * factor, 2)
+    import_base_d = round(import_base * factor, 2)
+    import_vat_d = round(import_vat * factor, 2)
+    investment_base_d = round(investment_base * factor, 2)
+    investment_vat_d = round(investment_vat * factor, 2)
+
+    accrued_27 = round(output_vat + intra_vat + isp_vat + recargo_vat_total, 2)
+    deductible_45 = round(
+        input_vat + investment_vat_d + import_vat_d + intra_vat_d, 2
+    )
+    result = round(accrued_27 - deductible_45, 2)
+
+    _put(buf, 696, _signed(accrued_27, 17))  # [27]
     _put(buf, 713, _num(input_base, 17))  # [28]
     _put(buf, 730, _num(input_vat, 17))  # [29]
-    _put(buf, 1002, _signed(input_vat, 17))  # [45]
-    result = round(output_vat - input_vat, 2)
+    _put(buf, 747, _num(investment_base_d, 17))  # [30]
+    _put(buf, 764, _num(investment_vat_d, 17))  # [31]
+    _put(buf, 781, _num(import_base_d, 17))  # [32]
+    _put(buf, 798, _num(import_vat_d, 17))  # [33]
+    _put(buf, 849, _num(intra_base_d, 17))  # [36]
+    _put(buf, 866, _num(intra_vat_d, 17))  # [37]
+    _put(buf, 1002, _signed(deductible_45, 17))  # [45]
     _put(buf, 1019, _signed(result, 17))  # [46]
 
     _put(buf, 1570, "</T30301000>")

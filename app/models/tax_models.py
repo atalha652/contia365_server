@@ -131,7 +131,7 @@ class IRPFSummary(BaseModel):
     # Net income
     net_income: Decimal = Field(default=Decimal("0"), description="Gross income - Deductible expenses")
     
-    # IRPF calculation (20% for professionals, 15% for business)
+    # IRPF rate as a percentage (20 estimación directa, 7 starters)
     irpf_rate: Decimal = Field(default=Decimal("20"))
     irpf_payable: Decimal = Field(default=Decimal("0"))
     

@@ -42,7 +42,7 @@ def build_page_01(
     casilla_12 = casilla_07
     casilla_14 = casilla_12
     casilla_17 = casilla_14
-    casilla_19 = float(totals.irpf_payable or 0)
+    casilla_19 = round(max(0.0, casilla_07), 2)
     tipo = declaration_type or declaration_type_ingreso(casilla_19)
     write_identity(
         buf, modelo="130", nif=nif, name=name, year=year, period=period,
