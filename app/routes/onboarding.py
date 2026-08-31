@@ -3,7 +3,7 @@ Onboarding Routes for Contia365
 Handles user type selection and onboarding completion
 """
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Request
 from pymongo import MongoClient
 from bson import ObjectId
 import os
@@ -19,6 +19,7 @@ from app.models.onboarding import (
     CountrySelectResponse, COUNTRY_CONFIGS,
     SELECTABLE_USER_TYPES, USER_TYPE_CATALOG,
     BusinessProfileRequest, RepresentativeRequest, AeatConnectRequest,
+    PersonAeatConnectRequest,
 )
 from app.routes.auth import get_current_user
 from app.services.onboarding_status import persist_computed_onboarding
@@ -400,9 +401,18 @@ async def save_representative(
 # Business onboarding — Step 4: AEAT Connection
 # ===========================================================================
 
+def extract_client_info(req: Request) -> tuple[str, str]:
+    client_ip = req.headers.get("x-forwarded-for") or (req.client.host if req.client else "unknown")
+    if "," in client_ip:
+        client_ip = client_ip.split(",")[0].strip()
+    user_agent = req.headers.get("user-agent") or "unknown"
+    return client_ip, user_agent
+
+
 @router.post("/business/aeat-connect")
 async def aeat_connect(
     request: AeatConnectRequest,
+    raw_request: Request,
     current_user: dict = Depends(get_current_user),
 ):
     """
@@ -439,6 +449,7 @@ async def aeat_connect(
 
     now = datetime.utcnow()
     rep_nif = str(request.representative_nif or "").replace(" ", "").upper()
+    client_ip, user_agent = extract_client_info(raw_request)
 
     aeat_connection = {
         "connected": True,
@@ -446,6 +457,11 @@ async def aeat_connect(
         "representative_nif": rep_nif,
         "requires_reauth": False,
         "last_sync_at": now,
+        "representation_terms_version": request.representation_terms_version or "v1.0-2026",
+        "consent_accepted_at": now,
+        "ip_address": client_ip,
+        "user_agent": user_agent,
+        "apoderamiento_code": str(request.apoderamiento_code).strip() if request.apoderamiento_code else None,
     }
 
     # Also stamp connected_at on the representative record
@@ -471,6 +487,7 @@ async def aeat_connect(
         "current_step": status["current_step"],
         "onboarding_completed": status["onboarding_completed"],
     }
+
 
 
 # ===========================================================================
@@ -512,6 +529,82 @@ async def aeat_sync(current_user: dict = Depends(get_current_user)):
     }
 
 
+@router.get("/aeat-connection/status")
+async def get_aeat_connection_status(current_user: dict = Depends(get_current_user)):
+    """
+    Get current AEAT representation status for settings page.
+    Handles both person (autónomo) and business user types.
+    """
+    user_type = canonicalize_user_type(current_user.get("user_type_selection"))
+    if user_type == "person":
+        conn = current_user.get("person_aeat_connection") or {}
+        nif = conn.get("nif_nie") or current_user.get("tax_id") or ""
+    else:
+        conn = current_user.get("aeat_connection") or {}
+        rep = current_user.get("authorized_representative") or {}
+        nif = conn.get("representative_nif") or rep.get("dni_nie") or ""
+
+    connected = bool(conn.get("connected"))
+    connected_at = conn.get("connected_at")
+    if isinstance(connected_at, datetime):
+        connected_at = connected_at.isoformat()
+
+    consent_accepted_at = conn.get("consent_accepted_at")
+    if isinstance(consent_accepted_at, datetime):
+        consent_accepted_at = consent_accepted_at.isoformat()
+
+    return {
+        "user_type": user_type,
+        "connected": connected,
+        "connected_at": connected_at,
+        "nif": nif,
+        "requires_reauth": bool(conn.get("requires_reauth")),
+        "last_sync_at": conn.get("last_sync_at").isoformat() if isinstance(conn.get("last_sync_at"), datetime) else conn.get("last_sync_at"),
+        # Legal Audit Trail Fields
+        "representation_terms_version": conn.get("representation_terms_version") or "v1.0-2026",
+        "consent_accepted_at": consent_accepted_at or connected_at,
+        "ip_address": conn.get("ip_address"),
+        "apoderamiento_code": conn.get("apoderamiento_code"),
+    }
+
+
+
+@router.post("/aeat-connection/revoke")
+async def revoke_aeat_connection(current_user: dict = Depends(get_current_user)):
+    """
+    Revoke Contia365's AEAT representation authority.
+    Updates the connection status to connected=False.
+    """
+    user_type = canonicalize_user_type(current_user.get("user_type_selection"))
+    now = datetime.utcnow()
+
+    if user_type == "person":
+        users_collection.update_one(
+            {"_id": current_user["_id"]},
+            {"$set": {
+                "person_aeat_connection.connected": False,
+                "person_aeat_connection.revoked_at": now,
+                "updated_at": now,
+            }}
+        )
+    else:
+        users_collection.update_one(
+            {"_id": current_user["_id"]},
+            {"$set": {
+                "aeat_connection.connected": False,
+                "aeat_connection.revoked_at": now,
+                "updated_at": now,
+            }}
+        )
+
+    return {
+        "message": "AEAT representation authority revoked successfully.",
+        "connected": False,
+        "revoked_at": now.isoformat(),
+    }
+
+
+
 # ===========================================================================
 # Admin utility: flag a user for AEAT re-authentication
 # ===========================================================================
@@ -538,3 +631,223 @@ async def require_reauth(
         }}
     )
     return {"message": f"User {user_id} flagged for AEAT re-authentication."}
+
+
+# ===========================================================================
+# Person onboarding — Step 6: Digital Certificate Upload
+# ===========================================================================
+
+@router.post("/person/certificate")
+async def upload_person_certificate(
+    file: UploadFile = File(...),
+    password: str = Form(...),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Person onboarding step 6.
+    Upload the user's FNMT digital certificate (.p12 / .pfx).
+
+    The certificate is validated (password verified), then encrypted with
+    AES-256 (Fernet) using the server's master key before being stored in
+    MongoDB.  The password is NOT stored — it is only used to verify the
+    certificate and is discarded immediately.
+
+    Security:
+      - Only the encrypted blob is stored in the database.
+      - The raw .p12 and password never touch disk or logs.
+      - CERT_ENCRYPTION_KEY env var must be set in production.
+    """
+    from app.services.certificate_service import save_certificate
+
+    user_type = canonicalize_user_type(current_user.get("user_type_selection"))
+    if user_type != "person":
+        raise HTTPException(
+            status_code=400,
+            detail="Only person (autónomo) accounts use this endpoint.",
+        )
+
+    # Validate file extension
+    filename = file.filename or ""
+    if not filename.lower().endswith((".p12", ".pfx")):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid file type. Please upload a .p12 or .pfx certificate file.",
+        )
+
+    # Read file bytes
+    p12_bytes = await file.read()
+    if not p12_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    # Max 2 MB sanity check
+    if len(p12_bytes) > 2 * 1024 * 1024:
+        raise HTTPException(
+            status_code=400,
+            detail="File too large. Maximum allowed size is 2 MB.",
+        )
+
+    try:
+        cert_meta = save_certificate(
+            users_collection=users_collection,
+            user_id=str(current_user["_id"]),
+            p12_bytes=p12_bytes,
+            password=password,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    # Recompute onboarding status after upload
+    updated_user = users_collection.find_one({"_id": current_user["_id"]})
+    status = persist_computed_onboarding(
+        users_collection,
+        census_collection,
+        updated_user,
+    )
+
+    return {
+        "message": "Digital certificate uploaded and verified successfully.",
+        "certificate": cert_meta,
+        "current_step": status["current_step"],
+        "onboarding_completed": status["onboarding_completed"],
+    }
+
+
+@router.get("/person/certificate")
+async def get_person_certificate_status(
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Return certificate metadata for the current user.
+    Never returns the encrypted bytes or any key material.
+    """
+    from app.services.certificate_service import get_certificate_status
+
+    info = get_certificate_status(current_user)
+    if not info:
+        return {"uploaded": False}
+    return info
+
+
+@router.delete("/person/certificate")
+async def delete_person_certificate(
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Remove the stored certificate so the user can upload a new one.
+    Also resets the person_aeat_connection (they will need to re-authorize).
+    """
+    user_type = canonicalize_user_type(current_user.get("user_type_selection"))
+    if user_type != "person":
+        raise HTTPException(
+            status_code=400,
+            detail="Only person (autónomo) accounts use this endpoint.",
+        )
+
+    now = datetime.utcnow()
+    users_collection.update_one(
+        {"_id": current_user["_id"]},
+        {"$unset": {
+            "p12_encrypted": "",
+            "certificate_info": "",
+            "certificate_uploaded_at": "",
+            "certificate_valid_until": "",
+        },
+         "$set": {
+            "person_aeat_connection": {"connected": False},
+            "updated_at": now,
+        }}
+    )
+
+    status = persist_computed_onboarding(
+        users_collection,
+        census_collection,
+        {**current_user,
+         "p12_encrypted": None,
+         "certificate_info": None,
+         "person_aeat_connection": {"connected": False}},
+    )
+
+    return {
+        "message": "Certificate removed. You can now upload a new one.",
+        "current_step": status["current_step"],
+    }
+
+
+# ===========================================================================
+# Person onboarding — Step 7: AEAT Apoderamiento Confirmation
+# ===========================================================================
+
+@router.post("/person/aeat-connect")
+async def person_aeat_connect(
+    request: PersonAeatConnectRequest,
+    raw_request: Request,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Person onboarding step 7.
+    The individual user confirms they have granted apoderamiento (power of
+    attorney) to Contia365 on the AEAT portal.
+
+    Flow:
+      1. User goes to AEAT → Representación → Otorgar apoderamiento
+      2. Enters Contia365's NIF, selects procedures (G303, G130, etc.)
+      3. Returns here and clicks confirm → this endpoint is called
+
+    After this step, onboarding is complete for person accounts.
+    """
+    user_type = canonicalize_user_type(current_user.get("user_type_selection"))
+    if user_type != "person":
+        raise HTTPException(
+            status_code=400,
+            detail="Only person (autónomo) accounts use this endpoint.",
+        )
+
+    # Must have uploaded certificate first
+    if not current_user.get("certificate_info"):
+        raise HTTPException(
+            status_code=400,
+            detail="Upload your digital certificate before confirming the AEAT connection.",
+        )
+
+    nif_nie = str(request.nif_nie or "").replace(" ", "").upper()
+    if not nif_nie:
+        raise HTTPException(status_code=400, detail="NIF/NIE is required.")
+
+    now = datetime.utcnow()
+    client_ip, user_agent = extract_client_info(raw_request)
+
+    person_aeat_connection = {
+        "connected": True,
+        "connected_at": now,
+        "nif_nie": nif_nie,
+        "requires_reauth": False,
+        "last_sync_at": now,
+        "representation_terms_version": request.representation_terms_version or "v1.0-2026",
+        "consent_accepted_at": now,
+        "ip_address": client_ip,
+        "user_agent": user_agent,
+        "apoderamiento_code": str(request.apoderamiento_code).strip() if request.apoderamiento_code else None,
+    }
+
+
+    users_collection.update_one(
+        {"_id": current_user["_id"]},
+        {"$set": {
+            "person_aeat_connection": person_aeat_connection,
+            "updated_at": now,
+        }}
+    )
+
+    status = persist_computed_onboarding(
+        users_collection,
+        census_collection,
+        {**current_user, "person_aeat_connection": person_aeat_connection},
+    )
+
+    return {
+        "message": "AEAT authorization confirmed. Onboarding is complete.",
+        "person_aeat_connected": True,
+        "connected_at": now.isoformat(),
+        "current_step": status["current_step"],
+        "onboarding_completed": status["onboarding_completed"],
+    }

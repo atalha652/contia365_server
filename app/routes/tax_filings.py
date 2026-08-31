@@ -152,8 +152,10 @@ async def submit_tax_filing(
             current_user,
             body.comment,
             body.test_mode,
+            cert_password=body.cert_password,
         )
     )
+
 
 
 @router.get("/{filing_id}/justificante")

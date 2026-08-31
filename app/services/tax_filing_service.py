@@ -2,7 +2,7 @@
 
 import os
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 from uuid import uuid4
 
 from pymongo.errors import DuplicateKeyError
@@ -12,7 +12,9 @@ from app.models.tax_filing import TaxFilingStatus
 from app.repos.tax_filing_repo import TaxFilingRepository
 from app.services.aeat_modelo_client import AeatModeloClient, AeatModeloResponse
 from app.services.aeat_result_messages import enrich_aeat_result, readable_aeat_message
+from app.services.certificate_service import decrypt_p12, load_certificate_bytes
 from app.services.fiscal_profile_service import (
+
     applicable_modelos,
     get_canonical_fiscal_profile,
     obligation_periodicity,
@@ -362,10 +364,12 @@ class TaxFilingService:
         user: dict,
         comment: Optional[str],
         test_mode: bool,
+        cert_password: Optional[str] = None,
+        cert_mode: str = "taxpayer",
     ) -> dict:
         if test_mode:
             return self.submit_test(filing_id, user, comment)
-        return self.submit_live(filing_id, user, comment)
+        return self.submit_live(filing_id, user, comment, cert_password=cert_password, cert_mode=cert_mode)
 
     def submit_test(
         self,
@@ -398,6 +402,8 @@ class TaxFilingService:
         filing_id: str,
         user: dict,
         comment: Optional[str],
+        cert_password: Optional[str] = None,
+        cert_mode: str = "taxpayer",
     ) -> dict:
         filing = self._require_owner(filing_id, user)
         self._refuse_duplicate_submit(filing)
@@ -440,14 +446,74 @@ class TaxFilingService:
         except ModeloFileError as exc:
             raise ValueError(str(exc)) from exc
 
+        p12_bytes, password_to_use = self._get_p12_certificate(user, cert_password, mode=cert_mode)
+
         aeat_response = self.aeat_modelo_client.submit(
-            declaration.encode("latin-1"),
-            nif,
-            modelo,
+            declaration_bytes=declaration.encode("latin-1"),
+            p12_bytes=p12_bytes,
+            p12_password=password_to_use,
+            modelo=modelo,
         )
         return self._store_aeat_outcome(filing, user, comment, aeat_response)
 
+    def _get_p12_certificate(self, user: dict, cert_password: Optional[str], mode: Literal["taxpayer", "gestor"] = "taxpayer") -> tuple[bytes, str]:
+        """
+        Retrieve raw .p12 certificate bytes and password.
+
+        1. Customer uploaded certificate (delegated / individual).
+        2. Central Contia365 gestor certificate (Colaborador Social / Representative).
+        """
+        password_to_use = (
+            cert_password
+            or os.getenv("CERT_PASSWORD")
+            or os.getenv("AEAT_P12_PASSWORD")
+            or os.getenv("CONTIA_GESTOR_CERT_PASSWORD")
+            or os.getenv("CONTIA_P12_PASSWORD")
+            or ""
+        ).strip()
+
+        if mode == "taxpayer" and user.get("p12_encrypted"):
+            if not password_to_use:
+                raise ValueError("Providing cert_password is required for live submit.")
+            p12_bytes = decrypt_p12(user["p12_encrypted"])
+            return p12_bytes, password_to_use
+
+
+        if mode == "gestor" or not user.get("p12_encrypted"):
+            if mode == "gestor":
+                from app.services.user_type_vocab import canonicalize_user_type
+                user_type = canonicalize_user_type(user.get("user_type_selection"))
+                if user_type == "person":
+                    connected = bool((user.get("person_aeat_connection") or {}).get("connected"))
+                else:
+                    connected = bool((user.get("aeat_connection") or {}).get("connected"))
+
+                if not connected:
+                    raise ValueError(
+                        "AEAT representation (apoderamiento) is not active. "
+                        "Please authorize Contia365 in Settings -> AEAT Representation before submitting in Gestor mode."
+                    )
+
+            gestor_cert_path = (
+                os.getenv("CONTIA_GESTOR_CERT_PATH")
+                or os.getenv("CONTIA_P12_PATH")
+                or ""
+            ).strip()
+            if gestor_cert_path and os.path.exists(gestor_cert_path):
+                if not password_to_use:
+                    raise ValueError("Providing cert_password is required for live submit.")
+                with open(gestor_cert_path, "rb") as f:
+                    p12_bytes = f.read()
+                return p12_bytes, password_to_use
+            raise ValueError(
+                "No digital certificate found. Upload your .p12 certificate in "
+                "Settings or configure Contia365 gestor certificate environment variables."
+            )
+
+
+
     def record_result(
+
         self,
         filing_id: str,
         user: dict,

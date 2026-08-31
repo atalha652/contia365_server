@@ -2,7 +2,7 @@
 
 from datetime import datetime
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -49,6 +49,18 @@ class TaxFilingSubmitRequest(BaseModel):
         True,
         description="True = fake TEST- reference. False = live AEAT via T5+T6.",
     )
+    cert_password: Optional[str] = Field(
+        None,
+        description="Password for the .p12 certificate when submitting live",
+    )
+    # Choose which certificate to use for live submission:
+    #   "gestor"   – Contia365’s corporate certificate (requires apoderamiento)
+    #   "taxpayer" – The user‑uploaded .p12 certificate (delegated)
+    cert_mode: Literal["gestor", "taxpayer"] = Field(
+        "taxpayer",
+        description="Certificate mode for live submission",
+    )
+
 
 
 class TaxFilingResultRequest(BaseModel):

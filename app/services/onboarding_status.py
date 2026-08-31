@@ -5,7 +5,7 @@ Fiscal profile (Spain) is complete only when NIF/NIE, IAE code, and VAT regime
 are present on the latest census record — not merely because a file was uploaded.
 
 Business path: country → user_type → company_details → representative → aeat_connection → completed
-Person path:   country → user_type → fiscal_profile → completed
+Person path:   country → user_type → fiscal_profile → certificate_upload → person_aeat_connection → completed
 """
 
 from datetime import datetime
@@ -63,10 +63,25 @@ def is_representative_complete(user: dict) -> bool:
 
 def is_aeat_connected(user: dict) -> bool:
     """
-    True when AEAT connection is established and re-authentication is not required.
-    Works for both person (apoderamiento granted) and business (rep authenticated).
+    True when AEAT connection is established for a business account
+    and re-authentication is not required.
     """
     conn = user.get("aeat_connection") or {}
+    return bool(conn.get("connected")) and not bool(conn.get("requires_reauth"))
+
+
+# ---------------------------------------------------------------------------
+# Person path helpers
+# ---------------------------------------------------------------------------
+
+def is_certificate_uploaded(user: dict) -> bool:
+    """True when a valid .p12 certificate has been stored for this user."""
+    return bool(user.get("certificate_info"))
+
+
+def is_person_aeat_connected(user: dict) -> bool:
+    """True when the individual user has confirmed apoderamiento on AEAT."""
+    conn = user.get("person_aeat_connection") or {}
     return bool(conn.get("connected")) and not bool(conn.get("requires_reauth"))
 
 
@@ -116,6 +131,8 @@ def compute_onboarding_status(user: dict, census_collection: Collection) -> Dict
     latest = latest or latest_census_record(census_collection, user_id)
     fiscal_fields_ok = is_fiscal_profile_complete(latest)
     fiscal_needed = is_fiscal_required(country)
+    cert_ok = is_certificate_uploaded(user)
+    person_aeat_ok = is_person_aeat_connected(user)
 
     # ── Step resolution ──────────────────────────────────────────────────────
     if not country:
@@ -132,9 +149,13 @@ def compute_onboarding_status(user: dict, census_collection: Collection) -> Dict
         else:
             step, next_action = "completed", None
     else:
-        # Person path
+        # Person path: fiscal_profile → certificate_upload → person_aeat_connection → completed
         if fiscal_needed and not fiscal_fields_ok:
             step, next_action = "fiscal_profile", "Complete NIF/NIE, IAE and VAT regime"
+        elif fiscal_needed and not cert_ok:
+            step, next_action = "certificate_upload", "Upload your digital certificate (.p12/.pfx)"
+        elif fiscal_needed and not person_aeat_ok:
+            step, next_action = "person_aeat_connection", "Grant Contia365 representation on AEAT portal"
         else:
             step, next_action = "completed", None
 
@@ -144,7 +165,6 @@ def compute_onboarding_status(user: dict, census_collection: Collection) -> Dict
     if not country:
         fiscal_flag = False
     elif is_business:
-        # Business does not use the fiscal profile step
         fiscal_flag = False
     elif not fiscal_needed:
         fiscal_flag = True
@@ -160,6 +180,8 @@ def compute_onboarding_status(user: dict, census_collection: Collection) -> Dict
         # Person path
         "fiscal_profile_completed": fiscal_flag,
         "census_data_uploaded": is_census_file_uploaded(census_collection, user_id),
+        "certificate_uploaded": cert_ok,
+        "person_aeat_connected": person_aeat_ok,
         # Business path
         "business_profile_completed": biz_profile_ok,
         "representative_completed": rep_ok,
@@ -183,6 +205,8 @@ def persist_computed_onboarding(
         "onboarding_completed": status["onboarding_completed"],
         "onboarding_step": status["current_step"],
         "fiscal_profile_completed": status["fiscal_profile_completed"],
+        "certificate_uploaded": status["certificate_uploaded"],
+        "person_aeat_connected": status["person_aeat_connected"],
         "business_profile_completed": status["business_profile_completed"],
         "representative_completed": status["representative_completed"],
         "aeat_connected": status["aeat_connected"],

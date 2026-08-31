@@ -52,6 +52,8 @@ class OnboardingStep(str, Enum):
     USER_TYPE_SELECTION = "user_type_selection"
     # Person (autónomo) path
     FISCAL_PROFILE = "fiscal_profile"
+    CERTIFICATE_UPLOAD = "certificate_upload"   # Person: upload .p12 digital cert
+    PERSON_AEAT_CONNECTION = "person_aeat_connection"  # Person: confirm apoderamiento
     # Business (empresa) path
     COMPANY_DETAILS = "company_details"
     REPRESENTATIVE = "representative"
@@ -152,6 +154,12 @@ class AeatConnection(BaseModel):
     representative_nif: Optional[str] = None  # DNI/NIE of who completed the connection
     requires_reauth: bool = False
     last_sync_at: Optional[datetime] = None
+    # Legal Audit Trail Fields
+    representation_terms_version: Optional[str] = "v1.0-2026"
+    consent_accepted_at: Optional[datetime] = None
+    ip_address: Optional[str] = None
+    user_agent: Optional[str] = None
+    apoderamiento_code: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -186,6 +194,34 @@ class AeatConnectRequest(BaseModel):
     representative_nif: str = Field(
         ..., description="DNI/NIE of the representative who completed the AEAT connection"
     )
+    representation_terms_version: Optional[str] = Field(
+        "v1.0-2026", description="Version of representation terms agreed to by user"
+    )
+    apoderamiento_code: Optional[str] = Field(
+        None, description="Optional AEAT apoderamiento receipt or trámite reference code"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Person onboarding — certificate upload & AEAT connection
+# ---------------------------------------------------------------------------
+
+class PersonAeatConnectRequest(BaseModel):
+    """
+    Body for POST /onboarding/person/aeat-connect.
+    The individual user confirms they have granted apoderamiento to Contia365
+    on AEAT's portal using their digital certificate.
+    """
+    nif_nie: str = Field(
+        ..., description="User's NIF or NIE — used to confirm identity"
+    )
+    representation_terms_version: Optional[str] = Field(
+        "v1.0-2026", description="Version of representation terms agreed to by user"
+    )
+    apoderamiento_code: Optional[str] = Field(
+        None, description="Optional AEAT apoderamiento receipt or trámite reference code"
+    )
+
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +279,8 @@ class OnboardingStatus(BaseModel):
     # Person path flags
     fiscal_profile_completed: bool = False
     census_data_uploaded: bool = False
+    certificate_uploaded: bool = False          # Person: .p12 uploaded
+    person_aeat_connected: bool = False         # Person: apoderamiento granted
     # Business path flags
     business_profile_completed: bool = False
     representative_completed: bool = False
