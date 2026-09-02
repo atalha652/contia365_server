@@ -160,6 +160,11 @@ class AeatConnection(BaseModel):
     ip_address: Optional[str] = None
     user_agent: Optional[str] = None
     apoderamiento_code: Optional[str] = None
+    # Real-Time AEAT SOAP Verification Fields
+    verification_status: Optional[str] = None  # "VERIFIED", "PENDING", "NOT_FOUND", "REVOKED", "ERROR"
+    verification_message: Optional[str] = None
+    verified_at: Optional[datetime] = None
+    verification_source: Optional[str] = None  # "AEAT_SOAP_LIVE", "AEAT_SIMULATION", etc.
 
 
 # ---------------------------------------------------------------------------
@@ -191,8 +196,8 @@ class AeatConnectRequest(BaseModel):
     and granted apoderamiento to Contia365.
     No certificate is stored — this only records the connection event.
     """
-    representative_nif: str = Field(
-        ..., description="DNI/NIE of the representative who completed the AEAT connection"
+    representative_nif: Optional[str] = Field(
+        None, description="DNI/NIE of the representative who completed the AEAT connection (optional, defaults to saved representative)"
     )
     representation_terms_version: Optional[str] = Field(
         "v1.0-2026", description="Version of representation terms agreed to by user"

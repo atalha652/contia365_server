@@ -7,10 +7,13 @@ from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, R
 from pymongo import MongoClient
 from bson import ObjectId
 import os
+import logging
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import certifi
 from dotenv import load_dotenv
+
+from pydantic import BaseModel
 
 from app.models.onboarding import (
     UserTypeSelection, UserTypeInfo, OnboardingRequest,
@@ -19,11 +22,14 @@ from app.models.onboarding import (
     CountrySelectResponse, COUNTRY_CONFIGS,
     SELECTABLE_USER_TYPES, USER_TYPE_CATALOG,
     BusinessProfileRequest, RepresentativeRequest, AeatConnectRequest,
-    PersonAeatConnectRequest,
+    PersonAeatConnectRequest, TaxAddress,
 )
 from app.routes.auth import get_current_user
 from app.services.onboarding_status import persist_computed_onboarding
 from app.services.user_type_vocab import ADVISOR, canonicalize_user_type
+from app.services.aeat_apoderamiento_client import AeatApoderamientoClient
+
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
@@ -441,15 +447,44 @@ async def aeat_connect(
             detail="Complete company details before connecting to AEAT.",
         )
 
-    if not (current_user.get("authorized_representative") or {}).get("dni_nie"):
+    rep_doc = current_user.get("authorized_representative") or {}
+    saved_rep_dni = rep_doc.get("dni_nie")
+    if not saved_rep_dni:
         raise HTTPException(
             status_code=400,
             detail="Complete representative details before connecting to AEAT.",
         )
 
     now = datetime.utcnow()
-    rep_nif = str(request.representative_nif or "").replace(" ", "").upper()
+    raw_rep_nif = (request.representative_nif or "").strip() or saved_rep_dni
+    rep_nif = str(raw_rep_nif).replace(" ", "").upper()
     client_ip, user_agent = extract_client_info(raw_request)
+
+    company_cif = (current_user.get("business_profile") or {}).get("cif")
+    contia_nif = os.getenv("VITE_CONTIA_NIF", "B00000000")
+    apoderamiento_code = str(request.apoderamiento_code).strip() if request.apoderamiento_code else None
+
+    # Real-Time AEAT SOAP Verification
+    apoderamiento_client = AeatApoderamientoClient()
+    verification = apoderamiento_client.verify_apoderamiento(
+        poderdante_nif=company_cif,
+        apoderado_nif=contia_nif,
+        representative_dni=rep_nif,
+        apoderamiento_code=apoderamiento_code,
+    )
+
+    # If AEAT explicitly reports authorization not found / revoked, fail with actionable message
+    if not verification.is_valid and verification.status in ("NOT_FOUND", "REVOKED"):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error_code": verification.status,
+                "message": verification.message,
+                "company_cif": company_cif,
+                "contia_nif": contia_nif,
+                "source": verification.source,
+            },
+        )
 
     aeat_connection = {
         "connected": True,
@@ -461,7 +496,12 @@ async def aeat_connect(
         "consent_accepted_at": now,
         "ip_address": client_ip,
         "user_agent": user_agent,
-        "apoderamiento_code": str(request.apoderamiento_code).strip() if request.apoderamiento_code else None,
+        "apoderamiento_code": apoderamiento_code or verification.reference,
+        # Real-time verification metadata
+        "verification_status": verification.status,
+        "verification_message": verification.message,
+        "verified_at": verification.verified_at,
+        "verification_source": verification.source,
     }
 
     # Also stamp connected_at on the representative record
@@ -481,13 +521,155 @@ async def aeat_connect(
     )
 
     return {
-        "message": "AEAT connection established. Onboarding is complete.",
+        "message": "AEAT connection established and verified. Onboarding is complete.",
         "aeat_connected": True,
         "connected_at": now.isoformat(),
         "current_step": status["current_step"],
         "onboarding_completed": status["onboarding_completed"],
+        "verification": {
+            "status": verification.status,
+            "message": verification.message,
+            "source": verification.source,
+            "reference": verification.reference or apoderamiento_code,
+        },
     }
 
+
+class BusinessVerifyAeatRequest(BaseModel):
+    apoderamiento_code: Optional[str] = None
+
+
+@router.post("/business/verify-aeat")
+async def verify_business_aeat(
+    request: BusinessVerifyAeatRequest = BusinessVerifyAeatRequest(),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    On-demand live SOAP verification of AEAT apoderamiento for a business.
+    """
+    user_type = canonicalize_user_type(current_user.get("user_type_selection"))
+    if user_type != "business":
+        raise HTTPException(
+            status_code=400,
+            detail="Only business accounts use this endpoint.",
+        )
+
+    biz_profile = current_user.get("business_profile") or {}
+    company_cif = biz_profile.get("cif")
+    if not company_cif:
+        raise HTTPException(
+            status_code=400,
+            detail="Company CIF is required before AEAT verification.",
+        )
+
+    rep = current_user.get("authorized_representative") or {}
+    rep_dni = rep.get("dni_nie")
+    contia_nif = os.getenv("VITE_CONTIA_NIF", "B00000000")
+
+    client = AeatApoderamientoClient()
+    result = client.verify_apoderamiento(
+        poderdante_nif=company_cif,
+        apoderado_nif=contia_nif,
+        representative_dni=rep_dni,
+        apoderamiento_code=request.apoderamiento_code,
+    )
+
+    if current_user.get("aeat_connection"):
+        users_collection.update_one(
+            {"_id": current_user["_id"]},
+            {"$set": {
+                "aeat_connection.verification_status": result.status,
+                "aeat_connection.verification_message": result.message,
+                "aeat_connection.verified_at": result.verified_at,
+                "aeat_connection.verification_source": result.source,
+            }}
+        )
+
+    return {
+        "is_valid": result.is_valid,
+        "status": result.status,
+        "message": result.message,
+        "source": result.source,
+        "reference": result.reference,
+        "verified_at": result.verified_at.isoformat(),
+    }
+
+
+
+class UpdateBusinessProfileRequest(BaseModel):
+    legal_name: Optional[str] = None
+    company_type: Optional[str] = None
+    tax_address: Optional[TaxAddress] = None
+    representative_full_name: Optional[str] = None
+    representative_role: Optional[str] = None
+
+
+@router.get("/business/profile")
+async def get_business_profile(current_user: dict = Depends(get_current_user)):
+    """
+    Retrieve full company profile, representative, and AEAT connection status
+    for the settings page.
+    """
+    user_type = canonicalize_user_type(current_user.get("user_type_selection"))
+    if user_type != "business":
+        raise HTTPException(
+            status_code=400,
+            detail="Only business accounts have a company profile.",
+        )
+
+    return {
+        "company": current_user.get("business_profile") or {},
+        "representative": current_user.get("authorized_representative") or {},
+        "aeat_connection": current_user.get("aeat_connection") or {},
+    }
+
+
+@router.put("/business/profile")
+async def update_business_profile(
+    request: UpdateBusinessProfileRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Update company details or representative details post-onboarding.
+    """
+    user_type = canonicalize_user_type(current_user.get("user_type_selection"))
+    if user_type != "business":
+        raise HTTPException(
+            status_code=400,
+            detail="Only business accounts have a company profile.",
+        )
+
+    now = datetime.utcnow()
+    update_fields = {"updated_at": now}
+
+    if request.legal_name is not None:
+        update_fields["business_profile.legal_name"] = request.legal_name.strip()
+    if request.company_type is not None:
+        update_fields["business_profile.company_type"] = request.company_type.strip()
+    if request.tax_address is not None:
+        update_fields["business_profile.tax_address"] = request.tax_address.model_dump()
+
+    if request.representative_full_name is not None:
+        update_fields["authorized_representative.full_name"] = request.representative_full_name.strip()
+    if request.representative_role is not None:
+        valid_roles = {"administrador", "representante_legal", "apoderado"}
+        role = request.representative_role.strip().lower()
+        if role in valid_roles:
+            update_fields["authorized_representative.role"] = role
+
+    users_collection.update_one(
+        {"_id": current_user["_id"]},
+        {"$set": update_fields}
+    )
+
+    updated_user = users_collection.find_one({"_id": current_user["_id"]}) or {}
+
+    return {
+        "message": "Company profile updated successfully.",
+        "updated_at": now.isoformat(),
+        "company": updated_user.get("business_profile") or {},
+        "representative": updated_user.get("authorized_representative") or {},
+    }
 
 
 # ===========================================================================
@@ -565,6 +747,11 @@ async def get_aeat_connection_status(current_user: dict = Depends(get_current_us
         "consent_accepted_at": consent_accepted_at or connected_at,
         "ip_address": conn.get("ip_address"),
         "apoderamiento_code": conn.get("apoderamiento_code"),
+        # Verification fields
+        "verification_status": conn.get("verification_status") or ("VERIFIED" if connected else None),
+        "verification_message": conn.get("verification_message"),
+        "verified_at": conn.get("verified_at").isoformat() if isinstance(conn.get("verified_at"), datetime) else conn.get("verified_at"),
+        "verification_source": conn.get("verification_source"),
     }
 
 
